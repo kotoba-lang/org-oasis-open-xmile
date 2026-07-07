@@ -51,10 +51,66 @@
 
 (deftest unsupported-builtin-is-a-warning-not-an-error
   (let [model (-> (m/model "m" {:xmile/sim-specs (m/sim-specs 0 10)})
-                  (m/add-variable (m/aux "A" "SMTH1(1, 3)")))
+                  (m/add-variable (m/aux "A" "RANDOM()")))
         problems (v/validate model)]
     (is (v/valid? problems))
     (is (some #(= :xmile/unsupported-builtin (:xmile/code %)) (v/warnings problems)))))
+
+(deftest hidden-stock-builtins-are-no-longer-unsupported-warnings
+  (testing "DELAY1/DELAY3/SMTH1/SMTH3/TREND are implemented (xmile.execute/desugar-delays) --
+  a structurally well-formed call to one is fully valid, no warning at all"
+    (doseq [call ["DELAY1(1, 3)" "DELAY3(1, 3)" "SMTH1(1, 3)" "SMTH3(1, 3)" "TREND(1, 3)"]]
+      (let [model (-> (m/model "m" {:xmile/sim-specs (m/sim-specs 0 10)})
+                      (m/add-variable (m/aux "A" call)))
+            problems (v/validate model)]
+        (is (v/valid? problems) (str call " -> " problems))
+        (is (empty? (v/warnings problems)) (str call " -> " problems))))))
+
+(deftest delay-call-bad-arity
+  (let [model (-> (m/model "m" {:xmile/sim-specs (m/sim-specs 0 10)})
+                  (m/add-variable (m/aux "A" "DELAY1(1)")))
+        problems (v/validate model)]
+    (is (not (v/valid? problems)))
+    (is (some #(= :xmile/bad-delay-call (:xmile/code %)) (v/errors problems)))))
+
+(deftest delay-call-non-positive-time-constant
+  (doseq [call ["DELAY1(1, 0)" "DELAY1(1, -3)" "DELAY3(1, -1)" "SMTH1(1, 0)" "SMTH3(1, -2)" "TREND(1, 0)"]]
+    (let [model (-> (m/model "m" {:xmile/sim-specs (m/sim-specs 0 10)})
+                    (m/add-variable (m/aux "A" call)))
+          problems (v/validate model)]
+      (is (not (v/valid? problems)) call)
+      (is (some #(= :xmile/bad-delay-call (:xmile/code %)) (v/errors problems)) call))))
+
+(deftest delay-call-time-argument-not-a-literal-is-unchecked
+  (testing "delay-time positivity is only checked when it's a literal constant --
+  can't know a non-constant expression's sign until simulated"
+    (let [model (-> (m/model "m" {:xmile/sim-specs (m/sim-specs 0 10)})
+                    (m/add-variable (m/aux "T" "3"))
+                    (m/add-variable (m/aux "A" "DELAY1(1, T)")))
+          problems (v/validate model)]
+      (is (v/valid? problems)))))
+
+(deftest trend-initial-trend-argument-may-be-negative
+  (testing "TREND's optional 3rd (initial-trend) argument has no positivity constraint"
+    (let [model (-> (m/model "m" {:xmile/sim-specs (m/sim-specs 0 10)})
+                    (m/add-variable (m/aux "A" "TREND(1, 3, -0.5)")))
+          problems (v/validate model)]
+      (is (v/valid? problems)))))
+
+(deftest delay-mediated-coupling-is-not-an-algebraic-loop
+  (testing "A = DELAY1(B, 5), B = A + 1 is a legal delay-mediated coupling, not a same-tick loop --
+  the hidden stock DELAY1 desugars into is already known at the start of a step"
+    (let [model (-> (m/model "m" {:xmile/sim-specs (m/sim-specs 0 10)})
+                    (m/add-variable (m/aux "A" "DELAY1(B, 5)"))
+                    (m/add-variable (m/aux "B" "A + 1")))
+          problems (v/validate model)]
+      (is (empty? (filter #(= :xmile/algebraic-loop (:xmile/code %)) problems)))))
+  (testing "...but a genuine same-tick loop not mediated by a delay is still caught"
+    (let [model (-> (m/model "m" {:xmile/sim-specs (m/sim-specs 0 10)})
+                    (m/add-variable (m/aux "A" "B + 1"))
+                    (m/add-variable (m/aux "B" "A + 1")))
+          problems (v/validate model)]
+      (is (some #(= :xmile/algebraic-loop (:xmile/code %)) (v/errors problems))))))
 
 (deftest not-yet-executable-warnings
   (let [model (-> (m/model "m" {:xmile/sim-specs (m/sim-specs 0 10)})

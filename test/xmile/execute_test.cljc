@@ -67,3 +67,155 @@
   (let [model (-> (m/model "arr" {:xmile/sim-specs (m/sim-specs 0.0 1.0)})
                   (m/add-variable (m/stock "S" "0" {:xmile/stock-type :conveyor :xmile/length 5})))]
     (is (thrown? #?(:clj Exception :cljs js/Error) (ex/run model)))))
+
+;; --- sec 3.5.3 DELAY1/DELAY3/SMTH1/SMTH3/TREND (xmile.execute/desugar-delays) ---
+;;
+;; Construction + formulas verified against the Vensim Reference Manual's
+;; "equivalent equations" (see xmile.execute/desugar-delays docstring for
+;; URLs/citations); the analytic checks below are independently re-derived
+;; from those same hidden-stock ODEs (not just "the code agrees with
+;; itself" -- see each test's own derivation in its `testing` string).
+
+(deftest delay1-matches-analytic-exponential-approach
+  (testing "DELAY1 of a step input is a classic first-order exponential approach:
+  H(tau) = A*(1 - e^(-tau/T)) for tau = t-t0 >= 0, H=0 before the step fires
+  (dH/dt=(input-H)/T with H(t0)=0 solves exactly to this)"
+    (let [A 10.0 t0 2.0 T 5.0
+          model (-> (m/model "d1" {:xmile/sim-specs (m/sim-specs 0.0 30.0 {:xmile/dt 0.02 :xmile/method :rk4})})
+                    (m/add-variable (m/aux "D" (str "DELAY1(STEP(" A ", " t0 "), " T ")"))))
+          result (ex/run model)
+          times (:xmile/times result)
+          series (get-in result [:xmile/series "D"])
+          rows (map vector times series)
+          final-t (last times)
+          expected-final (* A (- 1.0 (Math/exp (- (/ (- final-t t0) T)))))]
+      ;; Note on tolerance: a fixed-step RK4 integrator is only 4th-order accurate for a SMOOTH
+      ;; forcing function; STEP's jump discontinuity at t0 introduces an O(dt) (not O(dt^4)) local
+      ;; truncation error at that one step, which then persists (decayed) rather than averaging away
+      ;; -- empirically confirmed linear in dt (dt=0.1 -> ~1.2e-4 error, dt=0.02 -> ~2.5e-5). dt=0.02
+      ;; keeps this comfortably under the tolerance below without a slow test.
+      (testing "flat at 0 before the step fires"
+        (is (every? (fn [[_ v]] (close? 0.0 v 1.0e-9)) (filter (fn [[t _]] (< t t0)) rows))))
+      (testing "converges to A (the step magnitude) once several time-constants have passed"
+        (is (close? expected-final (last series) 1.0e-4)))
+      (testing "monotonically approaches A from below, never overshoots"
+        (let [post (map second (filter (fn [[t _]] (>= t t0)) rows))]
+          (is (apply <= post))
+          (is (every? #(<= % A) post)))))))
+
+(deftest smth1-is-structurally-identical-to-delay1
+  (testing "SMTH1 and DELAY1 are the SAME hidden-stock construction (dH/dt=(input-H)/time) -- only
+  conventional SD-modeling naming/use differs, not the math -- so swapping DELAY1 for SMTH1 in an
+  otherwise-identical model produces the identical trajectory"
+    (let [sim-specs (m/sim-specs 0.0 20.0 {:xmile/dt 0.25 :xmile/method :rk4})
+          delay1-series (get-in (ex/run (-> (m/model "d" {:xmile/sim-specs sim-specs})
+                                            (m/add-variable (m/aux "X" "DELAY1(STEP(7, 1), 3)"))))
+                                [:xmile/series "X"])
+          smth1-series (get-in (ex/run (-> (m/model "s" {:xmile/sim-specs sim-specs})
+                                           (m/add-variable (m/aux "X" "SMTH1(STEP(7, 1), 3)"))))
+                               [:xmile/series "X"])]
+      (is (= delay1-series smth1-series)))))
+
+(deftest delay3-converges-to-input-steady-state
+  (testing "once input has been constant for several multiples of delay-time, DELAY3's output converges
+  to that same steady-state value (any stable material delay must eventually track a constant input)"
+    (let [A 10.0 t0 2.0 Td 3.0
+          model (-> (m/model "d3" {:xmile/sim-specs (m/sim-specs 0.0 40.0 {:xmile/dt 0.05 :xmile/method :rk4})})
+                    (m/add-variable (m/aux "D" (str "DELAY3(STEP(" A ", " t0 "), " Td ")"))))
+          series (get-in (ex/run model) [:xmile/series "D"])]
+      (is (close? A (last series) 1.0e-4)))))
+
+(deftest delay3-matches-erlang3-step-response
+  (testing "DELAY3 of a step is exactly a cascade of 3 identical first-order lags (delay-time/3 each,
+  all 3 stages sharing the same initial condition -- Vensim's own DELAY3 construction). The standard
+  step response of an N-stage identical-lag cascade is the Erlang-N CDF (e.g. Sterman, 'Business
+  Dynamics', ch. 11 material delays); for N=3: y(tau) = A*(1 - e^-x*(1+x+x^2/2)), x = tau/(delay-time/3)"
+    ;; dt=0.002: same STEP-discontinuity-induced O(dt) local error as delay1-matches-... above
+    ;; (empirically ~3.6e-4 here at dt=0.002, comfortably under the 1e-3 tolerance).
+    (let [A 8.0 t0 1.0 Td 6.0 DL (/ Td 3.0) dt 0.002 start 0.0
+          model (-> (m/model "d3" {:xmile/sim-specs (m/sim-specs start 20.0 {:xmile/dt dt :xmile/method :rk4})})
+                    (m/add-variable (m/aux "D" (str "DELAY3(STEP(" A ", " t0 "), " Td ")"))))
+          series (get-in (ex/run model) [:xmile/series "D"])
+          check-t (+ t0 (* 2.0 DL))
+          idx (long (Math/round (/ (- check-t start) dt)))
+          x (/ (- check-t t0) DL)
+          expected (* A (- 1.0 (* (Math/exp (- x)) (+ 1.0 x (/ (* x x) 2.0)))))]
+      (is (close? expected (nth series idx) 1.0e-3)))))
+
+(deftest trend-of-constant-input-is-zero
+  (testing "TREND of a constant input is 0 for all time -- no change, no trend (sec 3.5.3)"
+    (let [model (-> (m/model "tr" {:xmile/sim-specs (m/sim-specs 0.0 20.0 {:xmile/dt 0.5 :xmile/method :rk4})})
+                    (m/add-variable (m/aux "Tr" "TREND(50, 4)")))
+          series (get-in (ex/run model) [:xmile/series "Tr"])]
+      (is (every? #(close? 0.0 % 1.0e-9) series)))))
+
+(deftest trend-of-ramp-matches-closed-form
+  (testing "TREND of a ramp has an exact closed form, derived from Vensim's own TREND equivalent
+  equations (avval=INTEG((input-avval)/T, input/(1+0*T)), TREND=(input-avval)/(T*avval)): for
+  input(t)=m*(t-t0), t>=t0, solving that linear ODE gives avval(tau)=m*(tau-T*(1-e^-tau/T)), tau=t-t0,
+  so TREND(tau) = (1-e^-x) / (T*(x-1+e^-x)), x=tau/T -- independent of the ramp's own slope m"
+    (let [m-slope 3.0 t0 2.0 T 4.0 dt 0.05 start 0.0
+          model (-> (m/model "tr" {:xmile/sim-specs (m/sim-specs start 10.0 {:xmile/dt dt :xmile/method :rk4})})
+                    (m/add-variable (m/aux "Tr" (str "TREND(RAMP(" m-slope ", " t0 "), " T ")"))))
+          series (get-in (ex/run model) [:xmile/series "Tr"])
+          check-t (+ t0 (* 2.0 T))
+          idx (long (Math/round (/ (- check-t start) dt)))
+          x (/ (- check-t t0) T)
+          expected (/ (- 1.0 (Math/exp (- x))) (* T (+ x -1.0 (Math/exp (- x)))))]
+      (is (close? expected (nth series idx) 1.0e-3)))))
+
+(deftest nested-delay1-in-arithmetic-expression
+  (testing "DELAY1 nested inside a larger expression (not just a bare call as the whole equation) is
+  desugared correctly wherever it appears in the tree"
+    (let [model (-> (m/model "m" {:xmile/sim-specs (m/sim-specs 0.0 30.0 {:xmile/dt 1.0 :xmile/method :rk4})})
+                    (m/add-variable (m/aux "D" "2 * DELAY1(STEP(10,2), 3) + 1")))
+          series (get-in (ex/run model) [:xmile/series "D"])]
+      (is (= 1.0 (first series)))                 ; before the step: DELAY1=0, D=2*0+1
+      (is (close? 21.0 (last series) 0.01)))))     ; converged: DELAY1->10, D->2*10+1=21
+
+(deftest hidden-stock-names-do-not-leak-into-series
+  (testing "the public :xmile/series only ever contains the model's OWN declared variable names --
+  never the synthetic hidden stock/flow/aux xmile.execute/desugar-delays adds internally"
+    (let [model (-> (m/model "hidden" {:xmile/sim-specs (m/sim-specs 0.0 5.0 {:xmile/dt 1.0})})
+                    (m/add-variable (m/aux "D1" "DELAY1(STEP(10,2), 3)"))
+                    (m/add-variable (m/aux "D3" "DELAY3(STEP(10,2), 3)"))
+                    (m/add-variable (m/aux "S1" "SMTH1(STEP(10,2), 3)"))
+                    (m/add-variable (m/aux "S3" "SMTH3(STEP(10,2), 3)"))
+                    (m/add-variable (m/aux "Tr" "TREND(STEP(10,2), 3)")))
+          result (ex/run model)]
+      (is (= #{"D1" "D3" "S1" "S3" "Tr"} (set (keys (:xmile/series result))))))))
+
+(deftest desugar-delays-adds-expected-hidden-variables
+  (testing "DELAY1 adds exactly 1 hidden stock + 1 hidden driving flow; the call site becomes a bare :ref"
+    (let [model (-> (m/model "m" {:xmile/sim-specs (m/sim-specs 0.0 10.0)})
+                    (m/add-variable (m/aux "A" "DELAY1(5, 3)")))
+          {desugared :xmile/model hidden :xmile/hidden-names} (ex/desugar-delays model)
+          kinds (map #(:xmile/kind (m/lookup desugared %)) hidden)]
+      (is (= 2 (count hidden)))
+      (is (= 1 (count (filter #{:stock} kinds))))
+      (is (= 1 (count (filter #{:flow} kinds))))
+      (is (= [:ref (first (filter #(= :stock (:xmile/kind (m/lookup desugared %))) hidden))]
+             (:xmile/eqn (m/lookup desugared "A"))))))
+  (testing "DELAY3/SMTH3 add 3 hidden stocks + 3 hidden flows (a 3-stage cascade)"
+    (doseq [call ["DELAY3(5, 3)" "SMTH3(5, 3)"]]
+      (let [model (-> (m/model "m" {:xmile/sim-specs (m/sim-specs 0.0 10.0)})
+                      (m/add-variable (m/aux "A" call)))
+            {desugared :xmile/model hidden :xmile/hidden-names} (ex/desugar-delays model)
+            kinds (map #(:xmile/kind (m/lookup desugared %)) hidden)]
+        (is (= 6 (count hidden)) call)
+        (is (= 3 (count (filter #{:stock} kinds))) call)
+        (is (= 3 (count (filter #{:flow} kinds))) call))))
+  (testing "TREND adds 1 hidden Level stock + 1 hidden flow + 1 hidden aux (the trend expression itself)"
+    (let [model (-> (m/model "m" {:xmile/sim-specs (m/sim-specs 0.0 10.0)})
+                    (m/add-variable (m/aux "A" "TREND(5, 3)")))
+          {desugared :xmile/model hidden :xmile/hidden-names} (ex/desugar-delays model)
+          kinds (map #(:xmile/kind (m/lookup desugared %)) hidden)]
+      (is (= 3 (count hidden)))
+      (is (= 1 (count (filter #{:stock} kinds))))
+      (is (= 1 (count (filter #{:flow} kinds))))
+      (is (= 1 (count (filter #{:aux} kinds)))))))
+
+(deftest desugar-delays-throws-on-bad-arity
+  (let [model (-> (m/model "m" {:xmile/sim-specs (m/sim-specs 0.0 10.0)})
+                  (m/add-variable (m/aux "A" "DELAY1(5)")))]
+    (is (thrown? #?(:clj Exception :cljs js/Error) (ex/desugar-delays model)))))

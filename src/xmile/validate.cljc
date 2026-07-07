@@ -3,12 +3,20 @@
   kotoba.dsl.problem-shaped problems (:xmile/severity :error|:warn).
 
   :error means the model is not valid XMILE (dangling reference, illegal
-  algebraic loop, malformed sim_specs/gf, ...). :warn means the model IS
-  valid XMILE but exercises a feature xmile.execute v1 does not yet
-  simulate (arrays, conveyor/queue transport, DELAY*/SMTH*/TREND/FORCST,
-  stochastic functions, integration methods other than euler/rk4) -- see
-  README Follow-ups. A model with only :warn problems is spec-valid but
-  xmile.execute/run will throw if you actually try to run it."
+  algebraic loop, malformed sim_specs/gf, a malformed DELAY1/DELAY3/SMTH1/
+  SMTH3/TREND call, ...). :warn means the model IS valid XMILE but
+  exercises a feature xmile.execute v1 does not yet simulate (arrays,
+  conveyor/queue transport, DELAY/DELAYN/SMTHN/FORCST, stochastic
+  functions, integration methods other than euler/rk4) -- see README
+  Follow-ups. A model with only :warn problems is spec-valid but
+  xmile.execute/run will throw if you actually try to run it.
+
+  DELAY1/DELAY3/SMTH1/SMTH3/TREND (xmile.expr/hidden-stock-builtins) are
+  IMPLEMENTED (xmile.execute/desugar-delays), so a call to one of them is
+  no longer flagged as :xmile/unsupported-builtin -- instead
+  `delay-smooth-problems` below checks it's a structurally usable call
+  (right argument count; a positive delay/smoothing/averaging-time where
+  that argument is a literal constant)."
   (:require [clojure.string :as str]
             [clojure.set :as set]
             [kotoba.dsl.problem :as problem]
@@ -43,7 +51,9 @@
 (defn eqn-problems
   "Per-variable equation problems: parse errors, dangling references
   (sec 3.3), and calls to sec 3.5.2/3.5.3 built-ins xmile.expr does not
-  implement (v2 scope-out)."
+  implement at all (v2 scope-out; DELAY1/DELAY3/SMTH1/SMTH3/TREND are
+  implemented -- see `delay-smooth-problems` below for their own
+  structural checks -- so calls to them are not flagged here)."
   [model]
   (let [names (m/variable-names model)
         known (into names #{"TIME" "DT"})]
@@ -64,6 +74,59 @@
                    unsupported))))))
      (m/variables model))))
 
+(defn- const-num
+  "The literal numeric value of a :num expr node (or a :neg of one --
+  `parse` always represents a negative literal as unary minus applied to a
+  positive :num, e.g. \"-3\" => [:neg [:num 3.0]]), or nil if `e` isn't a
+  constant at all (i.e. it's some other expression -- delay/smoothing/
+  averaging-time positivity can only be statically checked when it's a
+  literal constant)."
+  [e]
+  (case (first e)
+    :num (second e)
+    :neg (when-let [n (const-num (second e))] (- n))
+    nil))
+
+(defn delay-smooth-problems
+  "Structural checks for sec 3.5.3 DELAY1/DELAY3/SMTH1/SMTH3/TREND calls
+  (xmile.expr/hidden-stock-builtins -- implemented via
+  xmile.execute/desugar-delays, not flagged as :xmile/unsupported-builtin
+  by eqn-problems above): each takes 2 or 3 arguments (input,
+  delay/smoothing/averaging-time[, initial]); where that time argument is a
+  literal constant, it must be > 0 (a non-positive delay/smoothing/
+  averaging time is nonsensical -- it isn't checked when the argument is
+  itself an expression, since that can't be known until simulated). The
+  optional 3rd argument (initial value, or for TREND an initial TREND) has
+  no such constraint -- a trend can legitimately be negative."
+  [model]
+  (mapcat
+   (fn [v]
+     (let [nm (:xmile/name v)
+           parsed (try-parse (eqn-string v))]
+       (if (:error parsed)
+         []
+         (mapcat
+          (fn [[fn-name args]]
+            (if-not (contains? expr/hidden-stock-builtins fn-name)
+              []
+              (let [n (count args)]
+                (cond
+                  (not (contains? #{2 3} n))
+                  [(err :xmile/bad-delay-call [nm fn-name]
+                        (str nm "'s call to " fn-name
+                             " takes 2 or 3 arguments (input, time[, initial]), got " n))]
+
+                  :else
+                  (let [time-arg (second args)
+                        c (const-num time-arg)]
+                    (if (and c (not (pos? c)))
+                      [(err :xmile/bad-delay-call [nm fn-name]
+                            (str nm "'s call to " fn-name
+                                 "'s delay/smoothing/averaging-time argument must be > 0, got " c))]
+                      []))))))
+          (expr/calls (:ok parsed))))))
+   (m/variables model)))
+
 (defn flow-ref-problems
   "Every stock :xmile/inflows/:xmile/outflows name must be an existing :flow variable."
   [model]
@@ -82,14 +145,19 @@
   a stock's current value is already known at the start of a step, so an
   edge INTO a stock is not a same-tick ordering hazard; only cycles among
   flow/aux equations are illegal (sec 3.3 implies whole-model equations
-  must be evaluable, i.e. acyclic once stocks are treated as known)."
+  must be evaluable, i.e. acyclic once stocks are treated as known). Uses
+  `expr/same-tick-free-vars`, not plain `free-vars`: a reference that
+  appears only inside a DELAY1/DELAY3/SMTH1/SMTH3/TREND call's arguments is
+  ALSO not a same-tick hazard (xmile.execute desugars it into a hidden
+  stock -- see that namespace), which is what makes e.g. `A = DELAY1(B, 5)`
+  / `B = A + 1` a legal delay-mediated coupling, not an illegal loop."
   [model]
   (let [non-stock-names (into #{} (map :xmile/name (concat (m/flows model) (m/auxs model))))]
     (into {}
           (for [v (concat (m/flows model) (m/auxs model))
                 :let [parsed (try-parse (eqn-string v))]
                 :when (:ok parsed)]
-            [(:xmile/name v) (set/intersection non-stock-names (expr/free-vars (:ok parsed)))]))))
+            [(:xmile/name v) (set/intersection non-stock-names (expr/same-tick-free-vars (:ok parsed)))]))))
 
 (defn algebraic-loop-problems
   "Cycle-detect the flow/aux dependency graph via DFS (white/gray/black)."
@@ -143,6 +211,7 @@
   (vec (concat (sim-specs-problems model)
                (flow-ref-problems model)
                (eqn-problems model)
+               (delay-smooth-problems model)
                (algebraic-loop-problems model)
                (gf-problems model)
                (not-yet-executable-problems model))))

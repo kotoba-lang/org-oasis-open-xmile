@@ -67,13 +67,46 @@
     (is (= 0.0 (ev "PULSE(20, 12, 5)" {"TIME" 15.0 "DT" 1.0})))))
 
 (deftest unsupported-builtins-throw
-  (is (thrown? #?(:clj Exception :cljs js/Error) (ev "SMTH1(x, 3)" {"x" 1.0})))
+  (testing "sec 3.5.2/3.5.3 built-ins with no implementation anywhere (v2 scope-out)"
+    (is (thrown? #?(:clj Exception :cljs js/Error) (ev "RANDOM()")))
+    (is (thrown? #?(:clj Exception :cljs js/Error) (ev "DELAYN(x, 3, 2)" {"x" 1.0}))))
   (is (contains? (expr/called-fns (expr/parse "DELAY1(x, 3)")) "DELAY1")))
+
+(deftest hidden-stock-builtins-throw-outside-desugaring
+  (testing "DELAY1/DELAY3/SMTH1/SMTH3/TREND ARE implemented, but only via
+  xmile.execute/desugar-delays's model-level rewriting -- eval-expr itself
+  always throws on them directly (a real behavioral distinction from
+  unsupported-builtins, not the same kind of error)"
+    (doseq [fn-name ["DELAY1" "DELAY3" "SMTH1" "SMTH3" "TREND"]]
+      (is (contains? expr/hidden-stock-builtins fn-name))
+      (is (not (contains? expr/unsupported-builtins fn-name)))
+      (is (thrown? #?(:clj Exception :cljs js/Error) (ev (str fn-name "(x, 3)") {"x" 1.0}))
+          (str fn-name " must throw when eval'd directly")))))
+
+(deftest calls-finds-nested-call-nodes
+  (is (= [["MAX" [[:ref "a"] [:num 0.0]]]]
+         (expr/calls (expr/parse "MAX(a, 0)"))))
+  (testing "nested calls are all found, outer-first then inner"
+    (let [found (expr/calls (expr/parse "DELAY1(MAX(a, 0), 3)"))]
+      (is (= "DELAY1" (ffirst found)))
+      (is (some #(= "MAX" (first %)) found)))))
+
+(deftest same-tick-free-vars-excludes-delay-args
+  (testing "an ordinary nested call's args ARE a same-tick hazard"
+    (is (= #{"a" "b"} (expr/same-tick-free-vars (expr/parse "a + MAX(b, 0)")))))
+  (testing "a DELAY1/DELAY3/SMTH1/SMTH3/TREND call's args are NOT (hidden-stock-mediated)"
+    (is (= #{} (expr/same-tick-free-vars (expr/parse "DELAY1(a, 5)"))))
+    (is (= #{} (expr/same-tick-free-vars (expr/parse "TREND(a, 5)"))))
+    (testing "but a reference OUTSIDE the delay call in the same equation still counts"
+      (is (= #{"b"} (expr/same-tick-free-vars (expr/parse "DELAY1(a, 5) + b")))))))
 
 (deftest free-vars-and-called-fns
   (is (= #{"a" "b"} (expr/free-vars (expr/parse "a + MAX(b, 0)"))))
   (is (= #{"MAX"} (expr/called-fns (expr/parse "a + MAX(b, 0)"))))
-  (is (= #{} (expr/free-vars (expr/parse "TIME + DT")))))
+  (is (= #{} (expr/free-vars (expr/parse "TIME + DT"))))
+  (testing "free-vars (unlike same-tick-free-vars) still sees refs inside a DELAY1 call --
+  dangling-ref checking needs this"
+    (is (= #{"a"} (expr/free-vars (expr/parse "DELAY1(a, 5)"))))))
 
 (deftest parse-errors
   (is (thrown? #?(:clj Exception :cljs js/Error) (expr/parse "1 +")))

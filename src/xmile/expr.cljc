@@ -17,10 +17,17 @@
   EXP LN LOG10 SIN COS TAN ARCSIN ARCCOS ARCTAN INT PI INF MIN MAX (exactly
   2 args each, per spec) MOD (operator, not a call) PULSE STEP RAMP.
 
-  Built-ins NOT implemented (sec 3.5.2 stochastic, sec 3.5.3 delay/smooth --
-  a v2 scope-out, see README): RANDOM NORMAL EXPRND LOGNORMAL POISSON DELAY
-  DELAY1 DELAY3 DELAYN SMTH1 SMTH3 SMTHN TREND FORCST. `parse` accepts calls
-  to them (so a model round-trips through xmile.xml/xmile.validate);
+  Built-ins implemented ONLY via model-level hidden-stock desugaring (sec
+  3.5.3, see `hidden-stock-builtins` below and `xmile.execute/desugar-delays`):
+  DELAY1 DELAY3 SMTH1 SMTH3 TREND. `eval-expr` throws a clear, distinct
+  ex-info if one of these is evaluated directly (i.e. without first going
+  through xmile.execute's model-level desugaring) -- they need persistent
+  hidden-stock state a single stateless eval-expr call cannot represent.
+
+  Built-ins NOT implemented at all (sec 3.5.2 stochastic, and the remaining
+  sec 3.5.3 delay/smooth built-ins -- a v2 scope-out, see README): RANDOM
+  NORMAL EXPRND LOGNORMAL POISSON DELAY DELAYN SMTHN FORCST. `parse` accepts
+  calls to them (so a model round-trips through xmile.xml/xmile.validate);
   `eval-expr` throws a clear ex-info if one is actually evaluated.
 
   `PULSE`/`STEP`/`RAMP` read the reserved `\"TIME\"`/`\"DT\"` env entries
@@ -199,10 +206,29 @@
 ;; --- built-ins ---
 
 (def unsupported-builtins
-  "Sec 3.5.2 (stochastic) / 3.5.3 (delay+smooth+trend) built-ins -- valid
-  XMILE, not implemented by eval-expr (v2 scope-out, see README)."
+  "Sec 3.5.2 (stochastic) + still-unimplemented sec 3.5.3 (infinite/Nth-order
+  delay+smooth, forecast) built-ins -- valid XMILE, not implemented anywhere
+  in this library (v2 scope-out, see README). A host-injected seeded-RNG
+  port would be needed for the stochastic ones; DELAY/DELAYN/SMTHN/FORCST
+  are the same hidden-stock-desugaring family as `hidden-stock-builtins`
+  below but with an arbitrary/host-forecast order N this v1 doesn't build."
   #{"RANDOM" "NORMAL" "EXPRND" "LOGNORMAL" "POISSON"
-    "DELAY" "DELAY1" "DELAY3" "DELAYN" "SMTH1" "SMTH3" "SMTHN" "TREND" "FORCST"})
+    "DELAY" "DELAYN" "SMTHN" "FORCST"})
+
+(def hidden-stock-builtins
+  "Sec 3.5.3 DELAY1/DELAY3/SMTH1/SMTH3/TREND -- IMPLEMENTED, but only via
+  `xmile.execute/desugar-delays` model-level rewriting, not by `eval-expr`
+  directly: each needs persistent hidden state (one or more synthetic
+  stocks integrated alongside the model's own stocks over simulated time)
+  that a single eval-expr call over a stateless `env` cannot represent.
+  It's fine to `parse` an equation containing one of these (so a model
+  still round-trips / is checked structurally by xmile.validate); calling
+  `eval-expr` directly on a tree containing one (i.e. without first going
+  through xmile.execute's desugaring pass) throws -- this is a real,
+  intentional behavioral distinction from `unsupported-builtins` above, not
+  an oversight: these ARE implemented, just only in a simulated-model
+  context."
+  #{"DELAY1" "DELAY3" "SMTH1" "SMTH3" "TREND"})
 
 (def constants {"PI" m-pi "INF" m-inf})
 
@@ -301,6 +327,11 @@
                 (contains? unsupported-builtins nm)
                 (throw (ex-info (str "xmile.expr: " nm " is not yet implemented (v2 scope-out)")
                                  {:fn nm}))
+                (contains? hidden-stock-builtins nm)
+                (throw (ex-info (str "xmile.expr: " nm " requires model-level hidden-stock "
+                                      "desugaring (xmile.execute/desugar-delays) -- eval-expr "
+                                      "cannot evaluate it directly outside a simulated model")
+                                 {:fn nm}))
                 (contains? builtins nm)
                 ((get builtins nm) (mapv go arg-exprs) env)
                 :else
@@ -341,5 +372,63 @@
               (into (walk (nth e 1)) (walk (nth e 2)))
               :if (into (walk (nth e 1)) (into (walk (nth e 2)) (walk (nth e 3))))
               :call (into #{(second e)} (reduce into #{} (map walk (nth e 2))))
+              #{}))]
+    (walk expr)))
+
+(defn calls
+  "All :call nodes anywhere in an expr tree, as a seq of [fn-name arg-exprs]
+  pairs (arg-exprs are still expr trees, unevaluated -- e.g. for static
+  arity/argument-shape checks; see xmile.validate's DELAY1/DELAY3/SMTH1/
+  SMTH3/TREND call-shape checks)."
+  [expr]
+  (letfn [(walk [e]
+            (case (first e)
+              :num [] :ref []
+              (:neg :not) (walk (nth e 1))
+              (:add :sub :mul :div :mod :pow :lt :le :gt :ge :eq :ne :and :or)
+              (into (walk (nth e 1)) (walk (nth e 2)))
+              :if (into (walk (nth e 1)) (into (walk (nth e 2)) (walk (nth e 3))))
+              :call (into [[(second e) (nth e 2)]] (mapcat walk (nth e 2)))
+              []))]
+    (walk expr)))
+
+(defn same-tick-free-vars
+  "Like `free-vars`, but references that appear ONLY inside the arguments
+  of a `hidden-stock-builtins` (DELAY1/DELAY3/SMTH1/SMTH3/TREND) call do not
+  count as a same-instant (same-tick) dependency: `xmile.execute` desugars
+  each such call into one or more hidden STOCKS, and a stock's current
+  value is already known at the start of a simulation step -- exactly the
+  same rule `xmile.validate/non-stock-deps` already applies to an ordinary
+  stock reference (sec 3.1.1) -- so, unlike an ordinary nested call (e.g.
+  `MAX(F, 0)`, whose args ARE a same-tick hazard), a DELAY1/etc. argument
+  reference is not one. This is what makes `A = DELAY1(B, 5)` / `B = A + 1`
+  a legal (delay-mediated) coupling rather than an illegal same-tick
+  algebraic loop.
+
+  Used by `xmile.validate/algebraic-loop-problems`; dangling-ref checking
+  still uses plain `free-vars` (a DELAY1 argument must still resolve to a
+  real identifier, even though it's not a same-tick hazard).
+
+  Note this is a structural PRE-check on the model as written, not a full
+  simulation of xmile.execute's hidden-stock desugaring -- e.g. a
+  delay/smoothing/averaging-TIME argument that is itself a flow/aux could
+  in principle chain into a real cycle among the hidden variables
+  xmile.execute synthesizes (which this function, by design, never sees).
+  That residual case is still safe, just not pre-flagged here:
+  `xmile.execute/topo-order` independently re-derives its own order over
+  the fully-desugared model and throws on any real cycle regardless of
+  what validate said (same as it always has -- see its docstring)."
+  [expr]
+  (letfn [(walk [e]
+            (case (first e)
+              :num #{}
+              :ref (if (contains? #{"TIME" "DT"} (second e)) #{} #{(second e)})
+              (:neg :not) (walk (nth e 1))
+              (:add :sub :mul :div :mod :pow :lt :le :gt :ge :eq :ne :and :or)
+              (into (walk (nth e 1)) (walk (nth e 2)))
+              :if (into (walk (nth e 1)) (into (walk (nth e 2)) (walk (nth e 3))))
+              :call (if (contains? hidden-stock-builtins (second e))
+                      #{}
+                      (reduce into #{} (map walk (nth e 2))))
               #{}))]
     (walk expr)))

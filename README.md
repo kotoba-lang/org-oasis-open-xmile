@@ -30,9 +30,9 @@ parser dependency (host injects a parsed XML tree; see `xmile.xml`).
 |---|---|
 | Role | capability (data model + equation language + validation + simulation) |
 | Structural coverage | header, sim_specs, model_units, dimensions, model/variables (stock/flow/aux), gf -- round-trips through `xmile.xml` |
-| Equation language | full sec 3.3 grammar/precedence; sec 3.5.1 math + sec 3.5.4 test-input built-ins evaluate; sec 3.5.2 (stochastic) / 3.5.3 (delay/smooth/trend) parse but do not evaluate (v2, see Follow-ups) |
-| Simulation | scalar stocks, `:euler`/`:rk4`, non-negative clamping; conveyor/queue transport and arrays are not yet simulated (v2) |
-| Tests | round-trip/property coverage for every namespace |
+| Equation language | full sec 3.3 grammar/precedence; sec 3.5.1 math + sec 3.5.4 test-input built-ins evaluate; sec 3.5.3 `DELAY1`/`DELAY3`/`SMTH1`/`SMTH3`/`TREND` evaluate via model-level hidden-stock desugaring (`xmile.execute/desugar-delays`); sec 3.5.2 (stochastic) and the remaining sec 3.5.3 (`DELAY`/`DELAYN`/`SMTHN`/`FORCST`) parse but do not evaluate (v2, see Follow-ups) |
+| Simulation | scalar stocks, `:euler`/`:rk4`, non-negative clamping, sec 3.5.3 hidden-stock built-ins; conveyor/queue transport and arrays are not yet simulated (v2) |
+| Tests | round-trip/property coverage for every namespace; analytic (closed-form-vs-simulated) verification for the exponential-delay/smooth/Erlang-3/trend built-ins |
 | Runtime deps | `kotoba-lang/dsl-core` (validation-problem convention) only |
 
 ## Namespaces
@@ -56,6 +56,11 @@ parser dependency (host injects a parsed XML tree; see `xmile.xml`).
   feature `xmile.execute` v1 doesn't simulate yet.
 - `xmile.execute` -- a pure fixed-step simulator (Euler or classical RK4)
   over the stock ODE system defined by the model's flow/aux network.
+  `desugar-delays` implements sec 3.5.3 `DELAY1`/`DELAY3`/`SMTH1`/`SMTH3`/
+  `TREND` by rewriting the model once up front, adding the hidden stock(s)
+  each needs (exactly how Stella/Vensim implement them internally -- see
+  its docstring for the construction and citations), so the rest of the
+  Euler/RK4 machinery runs over the enlarged variable set unmodified.
 
 ## Contract
 
@@ -82,20 +87,44 @@ Reading a real `.xmile` file: parse the XML text with your host's XML
 parser into `{:tag :xmile :attrs {...} :content [...]}` (e.g.
 `clojure.data.xml/parse` on the JVM), then `(xmile.xml/parse-doc that-tree)`.
 
+Sec 3.5.3 `DELAY1`/`DELAY3`/`SMTH1`/`SMTH3`/`TREND` work directly as a
+variable's own equation -- no extra stock/flow wiring needed, `xmile.execute`
+adds the hidden stock(s) internally:
+
+```clojure
+(def perceived
+  (-> (m/model "perceived-rate" {:xmile/sim-specs (m/sim-specs 0.0 30.0 {:xmile/dt 0.1 :xmile/method :rk4})})
+      (m/add-variable (m/aux "Perceived_Rate" "SMTH1(STEP(10, 2), 3)"))))
+
+(get-in (execute/run perceived) [:xmile/series "Perceived_Rate"])
+;=> [0.0 0.0 ... exponentially approaches 10.0 after t=2]
+```
+
 ## Follow-ups (v2, out of scope for this landing)
 
 - **Stochastic built-ins** (sec 3.5.2: `RANDOM`/`NORMAL`/`EXPRND`/
-  `LOGNORMAL`/`POISSON`) and **delay/smooth/trend built-ins** (sec 3.5.3:
-  `DELAY`/`DELAY1`/`DELAY3`/`DELAYN`/`SMTH1`/`SMTH3`/`SMTHN`/`TREND`/
-  `FORCST`) -- `xmile.expr/parse` accepts calls to them (so a model
-  round-trips and validates structurally); `eval-expr` throws, and
+  `LOGNORMAL`/`POISSON`) -- `xmile.expr/parse` accepts calls to them (so a
+  model round-trips and validates structurally); `eval-expr` throws, and
   `xmile.validate` flags them as a `:warn`. A real implementation needs a
-  host-injected seeded-RNG port for the former and internal hidden-stock
-  state for the latter.
+  host-injected seeded-RNG port (a design decision -- which port shape,
+  whether/how seeds are threaded through the model -- this landing doesn't
+  make).
+- **`DELAY`/`DELAYN`/`SMTHN`/`FORCST`** (the rest of sec 3.5.3 --
+  `DELAY1`/`DELAY3`/`SMTH1`/`SMTH3`/`TREND` ARE implemented, see Maturity
+  above and `xmile.execute/desugar-delays`) -- `DELAY`/`DELAYN`/`SMTHN` are
+  the same hidden-stock-cascade construction but with an arbitrary
+  order/delay-time-per-stage `N` (`DELAY1`/`DELAY3`/`SMTH1`/`SMTH3` are the
+  fixed `N`=1/3 special cases this landing built); `FORCST` extrapolates a
+  TREND-derived growth rate forward over a horizon. Same `:warn` treatment
+  as the stochastic built-ins in the meantime.
 - **Conveyor/queue stock transport** (sec 3.7.2/3.7.3) -- modeled as data
   in `xmile.model`/round-trips through `xmile.xml`, but `xmile.execute`
   throws rather than approximate their transit-time/discrete-slot
-  mechanics silently.
+  mechanics silently. A conveyor's discrete-in-substance slug-queue
+  transport is a genuinely different execution model from the scalar-ODE
+  Euler/RK4 loop above (not just another hidden-stock ODE, unlike this
+  landing's DELAY1/DELAY3/SMTH1/SMTH3/TREND), so it's left as a dedicated
+  follow-up rather than approximated.
 - **Arrays / dimensioned variables** (sec 4.5) -- `xmile.xml` models
   `<dimensions>` structurally; per-element/apply-to-all array equations
   are not evaluated by `xmile.execute`.
