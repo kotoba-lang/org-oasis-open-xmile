@@ -216,6 +216,40 @@
                (gf-problems model)
                (not-yet-executable-problems model))))
 
+(defn document-problems
+  "XMILE 1.0 whole-document requirements that cannot be checked on an
+  isolated model: a header, one or more models, and at least one global or
+  model-local simulation specification."
+  [doc]
+  (let [models (:xmile/models doc)
+        has-sim-specs? (or (:xmile/sim-specs doc)
+                           (some :xmile/sim-specs models))]
+    (cond-> []
+      (nil? (:xmile/header doc))
+      (conj (err :xmile/missing-header :xmile/document
+                 "XMILE 1.0 requires exactly one top-level header"))
+      (empty? models)
+      (conj (err :xmile/missing-model :xmile/document
+                 "XMILE 1.0 requires one or more model elements"))
+      (not has-sim-specs?)
+      (conj (err :xmile/missing-document-sim-specs :xmile/document
+                 "XMILE 1.0 requires sim_specs globally or on at least one model")))))
+
+(defn validate-doc
+  "Validate a complete `xmile.xml/parse-doc` result. Global sim_specs are
+  applied as the effective default for models that do not override them,
+  matching XMILE 1.0 section 2.3."
+  [doc]
+  (let [global-ss (:xmile/sim-specs doc)]
+    (vec
+     (concat
+      (document-problems doc)
+      (mapcat (fn [model]
+                (validate (cond-> model
+                            (and global-ss (nil? (:xmile/sim-specs model)))
+                            (assoc :xmile/sim-specs global-ss))))
+              (:xmile/models doc))))))
+
 (defn errors   [problems] (problem/errors domain problems))
 (defn warnings [problems] (problem/warnings domain problems))
 (defn valid?   [problems] (problem/valid? domain problems))
