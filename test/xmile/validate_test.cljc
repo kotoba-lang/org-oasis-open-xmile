@@ -125,3 +125,19 @@
                   (m/add-variable (m/aux "A" "1" {:xmile/gf (m/gf :continuous [1])})))
         problems (v/validate model)]
     (is (some #(= :xmile/bad-gf (:xmile/code %)) (v/errors problems)))))
+
+(deftest whole-document-validation-inherits-global-sim-specs
+  (let [doc {:xmile/header {:xmile/vendor "kotoba-lang"}
+             :xmile/sim-specs (m/sim-specs 0 10 {:xmile/dt 1})
+             :xmile/models [(-> (m/model "m")
+                                (m/add-variable (m/stock "S" "0")))]}
+        problems (v/validate-doc doc)]
+    (is (v/valid? problems))
+    (is (empty? (v/errors problems)))))
+
+(deftest whole-document-required-sections
+  (let [problems (v/validate-doc {:xmile/models []})
+        codes (set (map :xmile/code (v/errors problems)))]
+    (is (contains? codes :xmile/missing-header))
+    (is (contains? codes :xmile/missing-model))
+    (is (contains? codes :xmile/missing-document-sim-specs))))

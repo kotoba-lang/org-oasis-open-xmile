@@ -34,6 +34,21 @@
       (is (= v (xml/parse-variable (xml/emit-variable v)))
           (str "round-trip failed for " (:xmile/name v))))))
 
+(deftest stock-flow-priority-is-preserved
+  (let [wire {:tag :stock :attrs {:name "Queue"}
+              :content [{:tag :eqn :content ["0"]}
+                        {:tag :inflow :content ["second"]}
+                        {:tag :inflow :content ["first"]}
+                        {:tag :outflow :content ["z"]}
+                        {:tag :outflow :content ["a"]}]}
+        parsed (xml/parse-stock wire)
+        emitted (xml/emit-variable parsed)]
+    (is (= ["second" "first"] (:xmile/inflow-order parsed)))
+    (is (= ["z" "a"] (:xmile/outflow-order parsed)))
+    (is (= ["second" "first"]
+           (mapv #(first (:content %))
+                 (filter #(= :inflow (:tag %)) (:content emitted)))))))
+
 (deftest model-round-trip
   (let [model (-> (m/model "bathtub" {:xmile/sim-specs (m/sim-specs 0.0 10.0 {:xmile/dt 1.0})})
                   (m/add-variable (m/stock "Inventory" "100" {:xmile/inflows #{"Production"}
@@ -56,3 +71,53 @@
                                  (m/add-variable (m/stock "Inventory" "100"))
                                  (m/add-variable (m/aux "Avg_Time" "4")))]}]
     (is (= doc (xml/parse-doc (xml/emit-doc doc))))))
+
+(deftest unsupported-standard-elements-are-preserved
+  (let [tree {:tag :xmile
+              :attrs {:version "1.0"}
+              :content
+              [{:tag :header :content [{:tag :vendor :content ["vendor"]}]}
+               {:tag :sim_specs
+                :content [{:tag :start :content ["0"]}
+                          {:tag :stop :content ["10"]}]}
+               {:tag :model :attrs {:name "m"}
+                :content
+                [{:tag :variables
+                  :content
+                  [{:tag :stock :attrs {:name "S"}
+                    :content [{:tag :eqn :content ["0"]}]}
+                   {:tag :module :attrs {:name "Submodel"}
+                    :content [{:tag :connect :content ["x"]}]}
+                   {:tag :group :attrs {:name "Inputs"} :content []}]}
+                 {:tag :views
+                  :content [{:tag :view :attrs {:type "stock_flow"} :content []}]}]}
+               {:tag :macro :attrs {:name "DOUBLE"}
+                :content [{:tag :eqn :content ["x * 2"]}]}]}
+        parsed (xml/parse-doc tree)]
+    (is (= [:module :group]
+           (mapv :tag (get-in parsed [:xmile/models 0 :xmile/variable-extensions]))))
+    (is (= [:views]
+           (mapv :tag (get-in parsed [:xmile/models 0 :xmile/extensions]))))
+    (is (= [:macro] (mapv :tag (:xmile/extensions parsed))))
+    (is (= parsed (xml/parse-doc (xml/emit-doc parsed))))))
+
+(deftest xmile-text-round-trip
+  (let [doc {:xmile/header {:xmile/vendor "kotoba & lang"
+                            :xmile/product {:xmile/name "xmile-clj" :xmile/version "1.0"}}
+             :xmile/sim-specs (m/sim-specs 0.0 10.0 {:xmile/dt 0.5 :xmile/method :rk4})
+             :xmile/models [(-> (m/model "bathtub")
+                                (m/add-variable
+                                 (m/stock "Inventory" "100"
+                                          {:xmile/inflows #{"Production"}
+                                           :xmile/doc "stock < capacity"}))
+                                (m/add-variable (m/flow "Production" "10")))]}
+        text (xml/emit-string doc)]
+    (is (re-find #"xmlns=\"http://docs.oasis-open.org/xmile/ns/XMILE/v1.0\"" text))
+    (is (re-find #"kotoba &amp; lang" text))
+    (is (= doc (xml/parse-string text)))))
+
+#?(:clj
+   (deftest xml-parser-rejects-doctype
+     (is (thrown? Exception
+                  (xml/parse-string
+                   "<!DOCTYPE xmile [<!ENTITY xxe SYSTEM \"file:///etc/passwd\">]><xmile><header><vendor>&xxe;</vendor></header></xmile>")))))

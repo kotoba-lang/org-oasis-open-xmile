@@ -43,3 +43,6 @@ jobs:
 
       - name: Run tests
         run: clojure -M:test
+      - name: Check official XMILE XSD conformance
+        if: matrix.java == '21'
+        run: clojure -M:conformance

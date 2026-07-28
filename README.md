@@ -7,7 +7,7 @@
 portable `.cljc`.** A [kotoba-lang](https://github.com/kotoba-lang) `org-*`
 library: the same pattern as `org-w3-webauthn`/`org-ietf-oauth2`/`org-ros` --
 a small, zero-third-party-dependency, portable implementation of an open
-standard, pure data in, pure data out. [System dynamics](https://en.wikipedia.org/wiki/System_dynamics)
+standard, XML text or pure data in, pure data out. [System dynamics](https://en.wikipedia.org/wiki/System_dynamics)
 (Jay Forrester's stock-and-flow modeling method) is the domain; XMILE 1.0
 (approved as an OASIS Standard 2015-12-14) is the interchange format
 Stella/iThink, insightmaker and others use for it. Spec references below
@@ -29,7 +29,7 @@ parser dependency (host injects a parsed XML tree; see `xmile.xml`).
 | | |
 |---|---|
 | Role | capability (data model + equation language + validation + simulation) |
-| Structural coverage | header, sim_specs, model_units, dimensions, model/variables (stock/flow/aux), gf -- round-trips through `xmile.xml` |
+| Structural coverage | header, sim_specs, model_units, dimensions, model/variables (stock/flow/aux), gf -- namespaced UTF-8 XML text and element trees round-trip through `xmile.xml`; stock inflow/outflow priority is retained; module/group/views/macro and other unimplemented standard elements survive as raw extensions |
 | Equation language | full sec 3.3 grammar/precedence; sec 3.5.1 math + sec 3.5.4 test-input built-ins evaluate; sec 3.5.3 `DELAY1`/`DELAY3`/`SMTH1`/`SMTH3`/`TREND` evaluate via model-level hidden-stock desugaring (`xmile.execute/desugar-delays`); sec 3.5.2 (stochastic) and the remaining sec 3.5.3 (`DELAY`/`DELAYN`/`SMTHN`/`FORCST`) parse but do not evaluate (v2, see Follow-ups) |
 | Simulation | scalar stocks, `:euler`/`:rk4`, non-negative clamping, sec 3.5.3 hidden-stock built-ins; conveyor/queue transport and arrays are not yet simulated (v2) |
 | Tests | round-trip/property coverage for every namespace; analytic (closed-form-vs-simulated) verification for the exponential-delay/smooth/Erlang-3/trend built-ins |
@@ -44,16 +44,21 @@ parser dependency (host injects a parsed XML tree; see `xmile.xml`).
   tree, sec 3.3 grammar/precedence) and `eval-expr` (pure evaluator, sec
   3.5 built-ins).
 - `xmile.xml` -- converts between an *already-parsed* XML element tree
-  (`{:tag :stock :attrs {...} :content [...]}`, exactly what
-  `clojure.data.xml`/`cljs.xml` already produce) and the `:xmile/*` EDN
-  model. Does not parse XML text and does not cover the diagram/display
-  layer (`<views>`/`<style>`) -- sec 3.7.5 itself says any XMILE-conformant
-  tool must be able to simulate a whole-model with no diagram at all.
+  (`{:tag :stock :attrs {...} :content [...]}`, compatible with
+  `clojure.data.xml`/`cljs.xml`) and the `:xmile/*` EDN model. It also
+  provides `parse-string`/`emit-string` for complete XML text; the JVM
+  parser disables DTDs, external entities and XInclude. Emitted documents
+  carry the required XMILE 1.0 version and namespace. It does not cover the
+  diagram/display layer (`<views>`/`<style>`). Elements not yet interpreted
+  by the runtime—including module/group/views/macro—are retained under
+  `:xmile/extensions` or `:xmile/variable-extensions` and emitted again.
 - `xmile.validate` -- structural checks (dangling references, illegal
   algebraic loops, malformed `sim_specs`/`gf`, unknown flow references)
   returning `kotoba.dsl.problem`-shaped problems. `:error` means the model
   is not valid XMILE; `:warn` means it's valid XMILE but exercises a
-  feature `xmile.execute` v1 doesn't simulate yet.
+  feature `xmile.execute` v1 doesn't simulate yet. `validate-doc` additionally
+  checks whole-document header/model/simulation-spec requirements and applies
+  global `sim_specs` to models that do not override them.
 - `xmile.execute` -- a pure fixed-step simulator (Euler or classical RK4)
   over the stock ODE system defined by the model's flow/aux network.
   `desugar-delays` implements sec 3.5.3 `DELAY1`/`DELAY3`/`SMTH1`/`SMTH3`/
@@ -83,9 +88,17 @@ parser dependency (host injects a parsed XML tree; see `xmile.xml`).
 (:xmile/times result)                           ;=> [0.0 1.0 2.0 ... 40.0]
 ```
 
-Reading a real `.xmile` file: parse the XML text with your host's XML
-parser into `{:tag :xmile :attrs {...} :content [...]}` (e.g.
-`clojure.data.xml/parse` on the JVM), then `(xmile.xml/parse-doc that-tree)`.
+Reading or writing a real `.xmile` file:
+
+```clojure
+(require '[xmile.xml :as xml])
+
+(def doc (xml/parse-string (slurp "model.xmile")))
+(spit "round-trip.xmile" (xml/emit-string doc))
+```
+
+Hosts that already own XML parsing can continue to call `parse-doc` with an
+element tree and `emit-doc` to receive one.
 
 Sec 3.5.3 `DELAY1`/`DELAY3`/`SMTH1`/`SMTH3`/`TREND` work directly as a
 variable's own equation -- no extra stock/flow wiring needed, `xmile.execute`
@@ -141,7 +154,12 @@ adds the hidden stock(s) internally:
 
 ```bash
 clojure -M:test
+clojure -M:conformance  # official OASIS XMILE 1.0 XSD
 ```
+
+See [`MATURITY.md`](MATURITY.md) for denominator-based percentages. XSD
+validity, structural preservation, semantic coverage and executable coverage
+are tracked separately.
 
 ## License
 

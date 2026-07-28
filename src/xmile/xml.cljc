@@ -1,11 +1,7 @@
 (ns xmile.xml
-  "Convert between an already-parsed XMILE XML element tree and the
-  xmile.model EDN. Does NOT parse XML text -- the host parses XML first
-  (e.g. clojure.data.xml on the JVM, DOMParser/goog.dom.xml on
-  ClojureScript) into the generic shape `{:tag :stock :attrs {...}
-  :content [...]}` (exactly what clojure.data.xml/parse or cljs.xml/parse
-  already produce); this namespace is pure data transformation, zero I/O,
-  zero XML-parsing deps.
+  "Convert XMILE XML text or a parsed XML element tree to/from xmile.model
+  EDN. `parse-string` is the file-content boundary; `parse-doc` remains the
+  portable pure-data boundary for hosts that already have an XML tree.
 
   Round-trip guarantee (for well-formed data):
     (= model (parse-model (emit-model model)))
@@ -18,7 +14,16 @@
   'any software which supports XMILE should be able to simulate all
   whole-models, even those without diagrams', so the display layer is out
   of scope here (see README Follow-ups)."
-  (:require [clojure.string :as str]))
+  (:require [clojure.string :as str])
+  #?(:clj
+     (:import (java.io StringReader)
+              (javax.xml XMLConstants)
+              (javax.xml.parsers DocumentBuilderFactory)
+              (org.w3c.dom NamedNodeMap Node NodeList)
+              (org.xml.sax ErrorHandler InputSource))))
+
+(def ^:private xmile-namespace
+  "http://docs.oasis-open.org/xmile/ns/XMILE/v1.0")
 
 ;; --- generic parsed-XML element accessors ---
 
@@ -36,6 +41,129 @@
 
 (defn- parse-num [s] #?(:clj (Double/parseDouble s) :cljs (js/parseFloat s)))
 (defn- num->str [n] (str n))
+
+;; --- XML text boundary ---
+
+#?(:clj
+   (defn- set-feature-if-supported! [factory feature value]
+     (try
+       (.setFeature factory feature value)
+       (catch Exception _ nil))
+     factory))
+
+#?(:clj
+   (defn- secure-document-builder []
+     (let [factory (DocumentBuilderFactory/newInstance)]
+       (.setNamespaceAware factory true)
+       (.setXIncludeAware factory false)
+       (.setExpandEntityReferences factory false)
+       (doseq [[feature value]
+               [[XMLConstants/FEATURE_SECURE_PROCESSING true]
+                ["http://apache.org/xml/features/disallow-doctype-decl" true]
+                ["http://xml.org/sax/features/external-general-entities" false]
+                ["http://xml.org/sax/features/external-parameter-entities" false]
+                ["http://apache.org/xml/features/nonvalidating/load-external-dtd" false]]]
+         (set-feature-if-supported! factory feature value))
+       (.newDocumentBuilder factory))))
+
+#?(:clj
+   (defn- node-name [^Node node]
+     (keyword (or (.getLocalName node) (.getNodeName node)))))
+
+#?(:clj
+   (defn- dom-element->tree [^Node node]
+     (let [^NamedNodeMap attrs (.getAttributes node)
+           attrs-map
+           (into {}
+                 (keep (fn [i]
+                         (let [a (.item attrs i)
+                               nm (or (.getLocalName a) (.getNodeName a))]
+                           (when-not (or (= "xmlns" nm)
+                                         (= "http://www.w3.org/2000/xmlns/" (.getNamespaceURI a)))
+                             [(keyword nm) (.getNodeValue a)]))))
+                 (range (.getLength attrs)))
+           ^NodeList children (.getChildNodes node)
+           content
+           (into []
+                 (keep (fn [i]
+                         (let [child (.item children i)]
+                           (case (.getNodeType child)
+                             1 (dom-element->tree child)
+                             (3 4) (.getNodeValue child)
+                             nil))))
+                 (range (.getLength children)))]
+       (cond-> {:tag (node-name node) :content content}
+         (seq attrs-map) (assoc :attrs attrs-map)))))
+
+(defn parse-xml-string
+  "Parse XML text into the generic element-tree shape accepted by
+  `parse-doc`. On the JVM the parser disables DTDs, external entities and
+  XInclude. In ClojureScript this uses the host `DOMParser`."
+  [xml-text]
+  #?(:clj
+     (let [builder (secure-document-builder)
+           _ (.setErrorHandler
+              builder
+              (reify ErrorHandler
+                (warning [_ error] (throw error))
+                (error [_ error] (throw error))
+                (fatalError [_ error] (throw error))))
+           doc (.parse builder (InputSource. (StringReader. xml-text)))]
+       (dom-element->tree (.getDocumentElement doc)))
+     :cljs
+     (let [parser (js/DOMParser.)
+           doc (.parseFromString parser xml-text "application/xml")
+           error (.querySelector doc "parsererror")]
+       (when error
+         (throw (ex-info "xmile.xml: malformed XML"
+                         {:message (.-textContent error)})))
+       (letfn [(node->tree [node]
+                 (let [attrs (.-attributes node)
+                       children (.-childNodes node)]
+                   (cond-> {:tag (keyword (or (.-localName node) (.-nodeName node)))
+                            :content
+                            (into []
+                                  (keep (fn [child]
+                                          (case (.-nodeType child)
+                                            1 (node->tree child)
+                                            (3 4) (.-nodeValue child)
+                                            nil)))
+                                  (array-seq children))}
+                     (pos? (.-length attrs))
+                     (assoc :attrs
+                            (into {}
+                                  (keep (fn [a]
+                                          (when-not (= "http://www.w3.org/2000/xmlns/" (.-namespaceURI a))
+                                            [(keyword (or (.-localName a) (.-name a)))
+                                             (.-value a)])))
+                                  (array-seq attrs))))))]
+         (node->tree (.-documentElement doc))))))
+
+(defn- xml-escape [s attribute?]
+  (cond-> (-> (str s)
+              (str/replace "&" "&amp;")
+              (str/replace "<" "&lt;")
+              (str/replace ">" "&gt;"))
+    attribute? (str/replace "\"" "&quot;")))
+
+(defn emit-xml-string
+  "Serialize a generic element tree produced by `emit-doc` as XML text."
+  [root]
+  (letfn [(write-element [{:keys [tag attrs content]}]
+            (let [tag-name (name tag)
+                  attrs-text (apply str
+                                    (for [[k v] (sort-by (comp name key) attrs)]
+                                      (str " " (name k) "=\"" (xml-escape v true) "\"")))
+                  body (apply str
+                              (map #(if (map? %)
+                                      (write-element %)
+                                      (xml-escape % false))
+                                   content))]
+              (if (seq content)
+                (str "<" tag-name attrs-text ">" body "</" tag-name ">")
+                (str "<" tag-name attrs-text "/>"))))]
+    (str "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+         (write-element root))))
 
 ;; --- sim_specs (sec 3.7.1) ---
 
@@ -97,18 +225,25 @@
     (first-child e :gf) (assoc :xmile/gf (parse-gf (first-child e :gf)))))
 
 (defn parse-stock [e]
-  (merge (parse-common e)
-         {:xmile/kind :stock
-          :xmile/inflows (set (map text-of (by-tag e :inflow)))
-          :xmile/outflows (set (map text-of (by-tag e :outflow)))
-          :xmile/stock-type (keyword (str/lower-case (or (attr e :type) "stock")))}
-         (when (child-text e :len) {:xmile/length (parse-num (child-text e :len))})
-         (when (child-text e :discrete) {:xmile/conveyor-discrete? (= "true" (child-text e :discrete))})
-         (when (child-text e :leak) {:xmile/leak (child-text e :leak)})
-         (when (seq (by-tag e :leak_integer)) {:xmile/leak-integer? true})
-         (when (seq (by-tag e :arrest)) {:xmile/arrest? true})
-         (when (child-text e :capacity) {:xmile/capacity (parse-num (child-text e :capacity))})
-         (when (child-text e :overflow) {:xmile/overflow (child-text e :overflow)})))
+  (let [inflows (mapv text-of (by-tag e :inflow))
+        outflows (mapv text-of (by-tag e :outflow))]
+    (merge (parse-common e)
+           (cond-> {:xmile/kind :stock
+                    :xmile/inflows (set inflows)
+                    :xmile/outflows (set outflows)
+                    :xmile/stock-type (keyword (str/lower-case (or (attr e :type) "stock")))}
+             ;; Priority is semantically significant for queues, conveyors and
+             ;; constrained/non-negative stocks (XMILE 1.0 sec 4.2). Keep the
+             ;; compact set API, but retain non-canonical wire order explicitly.
+             (not= inflows (vec (sort inflows))) (assoc :xmile/inflow-order inflows)
+             (not= outflows (vec (sort outflows))) (assoc :xmile/outflow-order outflows))
+           (when (child-text e :len) {:xmile/length (parse-num (child-text e :len))})
+           (when (child-text e :discrete) {:xmile/conveyor-discrete? (= "true" (child-text e :discrete))})
+           (when (child-text e :leak) {:xmile/leak (child-text e :leak)})
+           (when (seq (by-tag e :leak_integer)) {:xmile/leak-integer? true})
+           (when (seq (by-tag e :arrest)) {:xmile/arrest? true})
+           (when (child-text e :capacity) {:xmile/capacity (parse-num (child-text e :capacity))})
+           (when (child-text e :overflow) {:xmile/overflow (child-text e :overflow)}))))
 
 (defn parse-flow [e]
   (merge (parse-common e)
@@ -140,8 +275,10 @@
                  (cond-> {:name (:xmile/name v)}
                    (not= :stock (:xmile/stock-type v :stock)) (assoc :type (name (:xmile/stock-type v))))
                  (concat (emit-common-content v)
-                         (map #(text-elem :inflow %) (sort (:xmile/inflows v)))
-                         (map #(text-elem :outflow %) (sort (:xmile/outflows v)))
+                         (map #(text-elem :inflow %)
+                              (or (:xmile/inflow-order v) (sort (:xmile/inflows v))))
+                         (map #(text-elem :outflow %)
+                              (or (:xmile/outflow-order v) (sort (:xmile/outflows v))))
                          (when (:xmile/length v) [(text-elem :len (num->str (:xmile/length v)))])
                          (when (contains? v :xmile/conveyor-discrete?)
                            [(text-elem :discrete (str (:xmile/conveyor-discrete? v)))])
@@ -193,19 +330,32 @@
 ;; --- model / doc (sec 3.1, 3.7) ---
 
 (defn parse-model [e]
-  (cond-> {:xmile/variables
-           (into {}
-                 (for [v (elem-children (first-child e :variables))]
-                   (let [pv (parse-variable v)] [(:xmile/name pv) pv])))}
-    (attr e :name) (assoc :xmile/name (attr e :name))
-    (first-child e :sim_specs) (assoc :xmile/sim-specs (parse-sim-specs (first-child e :sim_specs)))))
+  (let [variable-elements (vec (elem-children (first-child e :variables)))
+        supported-variable? #(contains? #{:stock :flow :aux :auxiliary}
+                                        (tag-kw (:tag %)))
+        supported (filter supported-variable? variable-elements)
+        variable-extensions (vec (remove supported-variable? variable-elements))
+        extensions (vec (remove #(contains? #{:sim_specs :variables}
+                                             (tag-kw (:tag %)))
+                                (elem-children e)))]
+    (cond-> {:xmile/variables
+             (into {}
+                   (for [v supported]
+                     (let [pv (parse-variable v)] [(:xmile/name pv) pv])))}
+      (attr e :name) (assoc :xmile/name (attr e :name))
+      (first-child e :sim_specs) (assoc :xmile/sim-specs (parse-sim-specs (first-child e :sim_specs)))
+      (seq variable-extensions) (assoc :xmile/variable-extensions variable-extensions)
+      (seq extensions) (assoc :xmile/extensions extensions))))
 
 (defn emit-model [m]
   (elem :model
         (cond-> {} (:xmile/name m) (assoc :name (:xmile/name m)))
         (cond-> []
           (:xmile/sim-specs m) (conj (emit-sim-specs (:xmile/sim-specs m)))
-          true (conj (elem :variables {} (map emit-variable (vals (:xmile/variables m))))))))
+          true (conj (elem :variables {}
+                           (concat (map emit-variable (vals (:xmile/variables m)))
+                                   (:xmile/variable-extensions m))))
+          (seq (:xmile/extensions m)) (into (:xmile/extensions m)))))
 
 (defn parse-header [e]
   (cond-> {}
@@ -230,16 +380,36 @@
   "Parse a full <xmile> root element into {:xmile/header .. :xmile/sim-specs
   .. :xmile/model-units .. :xmile/dimensions .. :xmile/models [..]}."
   [root]
-  (cond-> {:xmile/models (mapv parse-model (by-tag root :model))}
-    (first-child root :header) (assoc :xmile/header (parse-header (first-child root :header)))
-    (first-child root :sim_specs) (assoc :xmile/sim-specs (parse-sim-specs (first-child root :sim_specs)))
-    (first-child root :model_units) (assoc :xmile/model-units (parse-units (first-child root :model_units)))
-    (first-child root :dimensions) (assoc :xmile/dimensions (parse-dimensions (first-child root :dimensions)))))
+  (let [extensions
+        (vec (remove #(contains? #{:header :sim_specs :model_units :dimensions :model}
+                                  (tag-kw (:tag %)))
+                     (elem-children root)))]
+    (cond-> {:xmile/models (mapv parse-model (by-tag root :model))}
+      (first-child root :header) (assoc :xmile/header (parse-header (first-child root :header)))
+      (first-child root :sim_specs) (assoc :xmile/sim-specs (parse-sim-specs (first-child root :sim_specs)))
+      (first-child root :model_units) (assoc :xmile/model-units (parse-units (first-child root :model_units)))
+      (first-child root :dimensions) (assoc :xmile/dimensions (parse-dimensions (first-child root :dimensions)))
+      (seq extensions) (assoc :xmile/extensions extensions))))
 
 (defn emit-doc [doc]
-  (elem :xmile {:version "1.0"}
+  (elem :xmile {:version "1.0" :xmlns xmile-namespace}
         (concat (when (:xmile/header doc) [(emit-header (:xmile/header doc))])
                 (when (:xmile/sim-specs doc) [(emit-sim-specs (:xmile/sim-specs doc))])
                 (when (:xmile/model-units doc) [(emit-units (:xmile/model-units doc))])
                 (when (:xmile/dimensions doc) [(emit-dimensions (:xmile/dimensions doc))])
-                (map emit-model (:xmile/models doc)))))
+                (map emit-model (:xmile/models doc))
+                (:xmile/extensions doc))))
+
+(defn parse-string
+  "Parse a complete XMILE XML string into the library's EDN document."
+  [xml-text]
+  (let [root (parse-xml-string xml-text)]
+    (when-not (tag= root :xmile)
+      (throw (ex-info "xmile.xml: expected <xmile> document root"
+                      {:tag (:tag root)})))
+    (parse-doc root)))
+
+(defn emit-string
+  "Serialize an XMILE EDN document as a complete namespaced XML document."
+  [doc]
+  (emit-xml-string (emit-doc doc)))
