@@ -219,3 +219,63 @@
   (let [model (-> (m/model "m" {:xmile/sim-specs (m/sim-specs 0.0 10.0)})
                   (m/add-variable (m/aux "A" "DELAY1(5)")))]
     (is (thrown? #?(:clj Exception :cljs js/Error) (ex/desugar-delays model)))))
+
+;; --- constant sub-environment (parameters are not re-derived per sub-step) ---
+
+(defn- param-model []
+  (-> (m/model "params" {:xmile/sim-specs (m/sim-specs 0.0 20.0 {:xmile/dt 1.0 :xmile/method :rk4})})
+      (m/add-variable (m/stock "S" "0" {:xmile/inflows #{"In"} :xmile/outflows #{"Out"}}))
+      ;; constants: a literal, and one derived from two literals
+      (m/add-variable (m/aux "rate" "10"))
+      (m/add-variable (m/aux "loss_frac" "0.5"))
+      (m/add-variable (m/aux "half_rate" "rate * loss_frac"))
+      ;; NOT constant: reads a stock / reads TIME / calls a test input
+      (m/add-variable (m/aux "level_ratio" "S / 100"))
+      (m/add-variable (m/aux "clock" "TIME"))
+      (m/add-variable (m/aux "gate" "STEP(1, 5)"))
+      (m/add-variable (m/aux "capped" "MIN(1, 2)"))
+      (m/add-variable (m/flow "In" "rate"))
+      (m/add-variable (m/flow "Out" "half_rate * level_ratio"))))
+
+(deftest constant-names-classifies-what-cannot-change
+  (let [model (param-model)
+        order (ex/topo-order model)
+        cnames (ex/constant-names model order)]
+    (testing "literals and expressions over literals are constant"
+      (is (contains? cnames "rate"))
+      (is (contains? cnames "loss_frac"))
+      (is (contains? cnames "half_rate"))
+      (is (contains? cnames "In")))
+    (testing "reading a stock is not constant"
+      (is (not (contains? cnames "level_ratio")))
+      (is (not (contains? cnames "Out"))))
+    (testing "TIME is an ordinary :ref the evaluator resolves from env -- never constant"
+      (is (not (contains? cnames "clock"))))
+    (testing "a built-in call is never folded: PULSE/STEP/RAMP read TIME without naming it"
+      (is (not (contains? cnames "gate")))
+      (is (not (contains? cnames "capped"))))))
+
+(deftest constant-env-evaluates-once-in-dependency-order
+  (let [model (param-model)
+        order (ex/topo-order model)
+        cenv (ex/constant-env model order (ex/constant-names model order))]
+    (is (= 10.0 (double (get cenv "rate"))))
+    (is (= 0.5 (double (get cenv "loss_frac"))))
+    (is (= 5.0 (double (get cenv "half_rate"))))
+    (is (nil? (get cenv "clock")))))
+
+(deftest folding-constants-does-not-change-the-trajectory
+  (testing "dS/dt = rate - half_rate*S/100 = 10 - S/20, so S(t) = 200(1 - e^(-t/20));
+            folding `rate`/`loss_frac`/`half_rate` out of the per-sub-step loop must
+            reproduce the closed form exactly, not merely the fixed point"
+    (let [result (ex/run (param-model))
+          series (:xmile/series result)
+          analytic (fn [t] (* 200.0 (- 1.0 (Math/exp (- (/ t 20.0))))))]
+      (doseq [[t s] (map vector (:xmile/times result) (get series "S"))]
+        (is (close? (analytic t) s 1e-3) (str "t=" t)))
+      (testing "a folded parameter still appears in the output series, at every row"
+        (is (= (count (:xmile/times result)) (count (get series "rate"))))
+        (is (every? #(= 10.0 (double %)) (get series "rate"))))
+      (testing "time-varying variables still vary"
+        (is (= (:xmile/times result) (mapv double (get series "clock"))))
+        (is (= #{0.0 1.0} (set (map double (get series "gate")))))))))

@@ -31,7 +31,7 @@ parser dependency (host injects a parsed XML tree; see `xmile.xml`).
 | Role | capability (data model + equation language + validation + simulation) |
 | Structural coverage | header, sim_specs, model_units, dimensions, model/variables (stock/flow/aux), gf -- namespaced UTF-8 XML text and element trees round-trip through `xmile.xml`; stock inflow/outflow priority is retained; module/group/views/macro and other unimplemented standard elements survive as raw extensions |
 | Equation language | full sec 3.3 grammar/precedence; sec 3.5.1 math + sec 3.5.4 test-input built-ins evaluate; sec 3.5.3 `DELAY1`/`DELAY3`/`SMTH1`/`SMTH3`/`TREND` evaluate via model-level hidden-stock desugaring (`xmile.execute/desugar-delays`); sec 3.5.2 (stochastic) and the remaining sec 3.5.3 (`DELAY`/`DELAYN`/`SMTHN`/`FORCST`) parse but do not evaluate (v2, see Follow-ups) |
-| Simulation | scalar stocks, `:euler`/`:rk4`, non-negative clamping, sec 3.5.3 hidden-stock built-ins; conveyor/queue transport and arrays are not yet simulated (v2) |
+| Simulation | scalar stocks, `:euler`/`:rk4`, non-negative clamping, sec 3.5.3 hidden-stock built-ins; parameters (variable-free auxes) evaluated once per run, not once per sub-step; conveyor/queue transport and arrays are not yet simulated (v2) |
 | Tests | round-trip/property coverage for every namespace; analytic (closed-form-vs-simulated) verification for the exponential-delay/smooth/Erlang-3/trend built-ins |
 | Runtime deps | `kotoba-lang/dsl-core` (validation-problem convention) only |
 
