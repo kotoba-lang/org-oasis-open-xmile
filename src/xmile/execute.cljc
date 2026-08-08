@@ -83,14 +83,65 @@
 (defn derivatives
   "{stock-name -> d(stock)/dt} at (t, stock-vals): sum of inflow values
   minus sum of outflow values, each already flow-non-negative-clamped by
-  eval-non-stocks."
-  [model order stock-vals t dt]
-  (let [env (eval-non-stocks model order stock-vals t dt)]
-    (into {}
-          (for [s (m/stocks model)]
-            [(:xmile/name s)
-             (- (reduce + 0.0 (map #(get env %) (:xmile/inflows s)))
-                (reduce + 0.0 (map #(get env %) (:xmile/outflows s))))]))))
+  eval-non-stocks. `extra-env` is passed straight through (see `run`, which
+  uses it to carry the once-per-run constant sub-environment)."
+  ([model order stock-vals t dt] (derivatives model order stock-vals t dt {}))
+  ([model order stock-vals t dt extra-env]
+   (let [env (eval-non-stocks model order stock-vals t dt extra-env)]
+     (into {}
+           (for [s (m/stocks model)]
+             [(:xmile/name s)
+              (- (reduce + 0.0 (map #(get env %) (:xmile/inflows s)))
+                 (reduce + 0.0 (map #(get env %) (:xmile/outflows s))))])))))
+
+;; --- constant sub-environment (sec 3.1.3 "converters" that are parameters) ---
+;;
+;; Real XMILE models declare every model parameter as an <aux> with a literal
+;; equation -- that is how Stella/Vensim surface a slider -- so a mid-size model
+;; is mostly constants: 87 of the 177 variables in the money/power/status model
+;; that motivated this. Re-deriving them inside `eval-non-stocks` costs one
+;; evaluation per variable per RK4 sub-step (4 per step), which is pure waste:
+;; their value cannot change during a run. `run` evaluates them once and passes
+;; the result down as `extra-env`.
+
+(defn- call-free-and-ref-in?
+  "True when `e` names no identifier outside `known` and contains no call.
+  Both exclusions are load-bearing and neither is conservatism for its own sake:
+  TIME/DT are ordinary :ref nodes (xmile.expr/free-vars filters them out of its
+  result, but the evaluator still resolves them from env), and the sec 3.5.4
+  test-input built-ins PULSE/STEP/RAMP read TIME out of `env` without taking it
+  as an argument -- so a tree holding either is time-varying even though it
+  mentions no variable."
+  [e known]
+  (case (first e)
+    :num  true
+    :ref  (contains? known (second e))
+    :call false
+    (every? #(call-free-and-ref-in? % known) (rest e))))
+
+(defn constant-names
+  "The subset of `order` (which is already dependency-first) whose value is
+  fixed for the whole run: a variable-free literal, or an expression over
+  variables that are themselves in that subset. Stocks are never included --
+  they are not in `order` -- so anything reading a stock falls out, and so
+  does anything reading TIME/DT or calling a built-in."
+  [model order]
+  (reduce (fn [known nm]
+            (cond-> known
+              (call-free-and-ref-in? (parsed-eqn (m/lookup model nm)) known)
+              (conj nm)))
+          #{}
+          order))
+
+(defn constant-env
+  "{name -> value} for `names`, evaluated once. `order` supplies the
+  dependency-first sequence; a constant may read another constant."
+  [model order names]
+  (reduce (fn [env nm]
+            (let [v (m/lookup model nm)]
+              (assoc env nm (clamp-non-negative v (expr/eval-expr (parsed-eqn v) env)))))
+          {}
+          (filter names order)))
 
 ;; --- sec 3.5.3 DELAY1/DELAY3/SMTH1/SMTH3/TREND, via hidden-stock desugaring ---
 ;;
@@ -330,18 +381,18 @@
 
 (defn- vec+ [a b scale] (into {} (for [[k v] a] [k (+ v (* scale (get b k 0.0)))])))
 
-(defn- euler-step [model order stock-vals t dt]
-  (let [d (derivatives model order stock-vals t dt)]
+(defn- euler-step [model order stock-vals t dt cenv]
+  (let [d (derivatives model order stock-vals t dt cenv)]
     (vec+ stock-vals d dt)))
 
-(defn- rk4-step [model order stock-vals t dt]
-  (let [k1 (derivatives model order stock-vals t dt)
+(defn- rk4-step [model order stock-vals t dt cenv]
+  (let [k1 (derivatives model order stock-vals t dt cenv)
         y2 (vec+ stock-vals k1 (/ dt 2.0))
-        k2 (derivatives model order y2 (+ t (/ dt 2.0)) dt)
+        k2 (derivatives model order y2 (+ t (/ dt 2.0)) dt cenv)
         y3 (vec+ stock-vals k2 (/ dt 2.0))
-        k3 (derivatives model order y3 (+ t (/ dt 2.0)) dt)
+        k3 (derivatives model order y3 (+ t (/ dt 2.0)) dt cenv)
         y4 (vec+ stock-vals k3 dt)
-        k4 (derivatives model order y4 (+ t dt) dt)]
+        k4 (derivatives model order y4 (+ t dt) dt cenv)]
     (into {} (for [[nm y] stock-vals]
                [nm (+ y (* (/ dt 6.0)
                            (+ (get k1 nm 0.0) (* 2 (get k2 nm 0.0))
@@ -379,16 +430,19 @@
         start (:xmile/start ss) stop (:xmile/stop ss) dt (:xmile/dt ss 1.0)
         method (:xmile/method ss :euler)
         order (topo-order desugared)
+        cnames (constant-names desugared order)
+        cenv (constant-env desugared order cnames)
+        dyn-order (vec (remove cnames order))
         n (long (m-round (/ (- stop start) dt)))
         var-names (m/variable-names model)
         step-fn (case method :euler euler-step :rk4 rk4-step)]
     (loop [i 0 stock-vals (initial-stocks desugared) times [] rows []]
       (let [t (+ start (* i dt))
-            env (eval-non-stocks desugared order stock-vals t dt)]
+            env (eval-non-stocks desugared dyn-order stock-vals t dt cenv)]
         (if (= i n)
           {:xmile/times (conj times t)
            :xmile/series (into {}
                                 (for [nm var-names]
                                   [nm (mapv #(get % nm) (conj rows env))]))}
-          (let [next-vals (clamp-stocks desugared (step-fn desugared order stock-vals t dt))]
+          (let [next-vals (clamp-stocks desugared (step-fn desugared dyn-order stock-vals t dt cenv))]
             (recur (inc i) next-vals (conj times t) (conj rows env))))))))
