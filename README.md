@@ -34,7 +34,7 @@ parser dependency (host injects a parsed XML tree; see `xmile.xml`).
 | Simulation | scalar stocks, `:euler`/`:rk4`, non-negative clamping, sec 3.5.3 hidden-stock built-ins; parameters (variable-free auxes) evaluated once per run, not once per sub-step; conveyor/queue transport and arrays are not yet simulated (v2) |
 | Tests | round-trip/property coverage for every namespace; analytic (closed-form-vs-simulated) verification for the exponential-delay/smooth/Erlang-3/trend built-ins |
 | Runtime deps | `kotoba-lang/dsl-core` (validation-problem convention) only |
-| Kotoba | scalar decision core of `xmile.expr` ported to `kotoba/xmile_expr_core.kotoba` and held to `xmile.expr` by a parity gate; `.cljc` remains the authority and the load path |
+| Kotoba | all of `xmile.expr/eval-expr` -- the scalar operations and the tree walk -- ported to `kotoba/xmile_expr_core.kotoba` and held to `xmile.expr` by two parity gates; the parser and `xmile.execute` are not ported; `.cljc` remains the authority and the load path |
 
 ## Namespaces
 
@@ -125,21 +125,48 @@ anywhere but a JVM or a JavaScript engine.
 `kotoba/xmile_expr_core.kotoba` carries the same semantics with no host math
 library underneath it: the transcendentals are fixed polynomial kernels in the
 Kotoba compiler's own f64 intrinsics, and the module sits in the `kotoba/pure`
-profile -- no capabilities, no ambient authority, f64 in and f64 out. It covers
-the sec 3.5.1 math built-ins, `^` and floored `MOD`, all six relational and
-three logical operators (XMILE has no boolean type; zero is false), and the sec
-3.5.4 `STEP`/`RAMP`/`PULSE` test inputs.
+profile -- no capabilities, no ambient authority. It is **the whole of
+`xmile.expr/eval-expr`**, in two halves:
 
-Expression-*tree* walking and the `{"Name" value}` environment stay in `.cljc`.
-Scalars cross; collection assembly does not. That boundary is the point of the
-split, not a temporary state of it.
+- **the operations** -- the sec 3.5.1 math built-ins, `^` and floored `MOD`,
+  all six relational and three logical operators (XMILE has no boolean type;
+  zero is false), and the sec 3.5.4 `STEP`/`RAMP`/`PULSE` test inputs.
+- **the walk** -- the expression tree as a sealed recursive value
+  (`:xmile/expr`) and the environment as a typed map, evaluated to
+  `[:result :f64 :string]`. Errors are values here, not exceptions: that is one
+  of the two constraints this language holds as permanent rather than
+  provisional.
+
+The walk preserves the parts of `eval-expr` that are *semantics* rather than
+implementation: `IF` evaluates one branch, `AND`/`OR` short-circuit, a refused
+built-in (`DELAY1`, `RANDOM`) is refused before its arguments are evaluated, and
+the environment is consulted before the reserved `PI`/`INF` table so a model
+that binds `PI` gets its own value. Each of those is a separate test, and each
+was shown to turn the gate red on its own.
+
+What is still `.cljc`: the tokenizer and parser (`xmile.expr/parse`),
+`xmile.xml`, `xmile.validate` and `xmile.execute`. A model still cannot be
+simulated without a JVM or a JavaScript engine -- what moved is the evaluator.
+
+One current-state note, because it is a constraint and not a design choice: the
+environment holds `f64-to-bits` patterns in a `[:map :string :i64]` because
+`[:map :string :f64]` is rejected today (*direct floating map keys or values are
+outside the structured scalar ABI*). The conversion is exact in both directions
+-- signed zero and NaN payloads survive, and there is a test that says so -- and
+two functions know about it, so widening the ABI is a two-function change.
 
 **`src/xmile/expr.cljc` is unchanged, and remains both the authority and the
 thing consumers load.** The port proves the logic is expressible; it does not
-replace it. `test/xmile/kotoba_expr_core_parity_test.clj` compiles the port and
-runs it through the KIR interpreter in the same JVM, asserting against the real
-`xmile.expr/eval-expr` -- exactly where the two agree, and exactly where they
-do not:
+replace it. Two gates compile the port and run it through the KIR interpreter in
+the same JVM, asserting against the real `xmile.expr`:
+
+- `test/xmile/kotoba_expr_core_parity_test.clj` -- the operations, one at a time.
+- `test/xmile/kotoba_eval_expr_parity_test.clj` -- the walk. Every case there
+  starts from an equation *string* and runs the real `xmile.expr/parse` over it,
+  so the trees under test are the ones the parser actually produces.
+
+Both keep the same two halves apart -- exactly where the two agree, and exactly
+where they do not:
 
 - **exact** -- `ABS` `SQRT` `INT` `MIN` `MAX` `MOD`, the relational and logical
   operators, `PI` `INF`, `STEP` `RAMP` `PULSE`. A one-ulp difference here would
@@ -162,6 +189,7 @@ the port is shaped around avoiding it.
 
 ```bash
 clojure -M:test -n xmile.kotoba-expr-core-parity-test
+clojure -M:test -n xmile.kotoba-eval-expr-parity-test
 ```
 
 ## Follow-ups (v2, out of scope for this landing)
