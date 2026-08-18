@@ -1,9 +1,35 @@
 (ns xmile-expr-core
+  (:schemas
+   {;; The XMILE expression tree (sec 3.3), as a sealed recursive value.
+    ;;
+    ;; The .cljc tree is `[:num n] [:ref "Name"] [:add a b] [:call "MAX" [a b]]
+    ;; ...`: operators are keywords in head position, calls carry a name string.
+    ;; Here BOTH are an application carrying a name, because they are the same
+    ;; thing -- `[:add a b]` and `MAX(a, b)` differ in surface syntax, not in
+    ;; what the evaluator does with them. Operators keep the lower-case spelling
+    ;; the .cljc keyword has (`"add"`, `"lt"`, `"if"`); XMILE function names are
+    ;; upper-case per sec 3.5, so the two namespaces cannot collide.
+    ;;
+    ;; Arity is structural -- `:app1` and `:app2` are different cases -- so an
+    ;; arity error cannot be represented rather than being caught, and
+    ;; `ABS(1, 2)` reaches the evaluator as an unknown 2-argument application.
+    :xmile/expr
+    [:variant :xmile/expr
+     [[:num :f64]
+      [:var :string]
+      [:app0 :string]
+      [:app1 [:vector [:string [:ref :xmile/expr]]]]
+      [:app2 [:vector [:string [:ref :xmile/expr] [:ref :xmile/expr]]]]
+      [:app3 [:vector [:string [:ref :xmile/expr] [:ref :xmile/expr]
+                       [:ref :xmile/expr]]]]]]})
   (:export [abs sqrt exp ln log10 sin cos tan arcsin arccos arctan
             floor int-part pow xmile-mod min-2 max-2 pi inf
             truthy bool-num not-num and-num or-num
             lt-num le-num gt-num ge-num eq-num ne-num
-            step-value ramp-value pulse-value]))
+            step-value ramp-value pulse-value
+            num-of var-of app0-of app1-of app2-of app3-of
+            env-empty env-put env-get
+            call-refusal apply0 apply1 apply2 eval-expr]))
 
 ;; The scalar decision core of `xmile.expr` (OASIS XMILE 1.0 sec 3.3/3.5),
 ;; written in Kotoba. `kotoba/pure`: no capabilities, no ambient authority,
@@ -180,3 +206,279 @@
       (if (f64-lt (xmile-mod (f64-sub t first-time) interval) dt)
         (f64-div magnitude dt)
         0.0))))
+
+;; ==========================================================================
+;; The evaluator (sec 3.3 / 3.5), over the recursive `:xmile/expr` value.
+;; ==========================================================================
+;;
+;; The scalar half above says what each XMILE operation MEANS. This half says
+;; how a tree of them is walked -- which is the other thing `xmile.expr/
+;; eval-expr` does, and the part that needed a recursive value to express at
+;; all (W4, ADR-2607279200 Delivery 4; qualified on :compiler / :kotoba-wasm /
+;; :kotoba-cljs).
+;;
+;; ERRORS ARE VALUES. `eval-expr` returns `[:result :f64 :string]` where the
+;; .cljc throws `ex-info`. That is this language's stated idiom and one of the
+;; two constraints it holds as permanent rather than provisional (`kotoba-lang/
+;; lang/surface-status.edn`, `:invariants :explicit-errors`
+;; = `:intentional-security-constraint`) -- it is not a native-backend
+;; workaround. Every arm therefore threads the failure of a subexpression out
+;; rather than unwinding past it.
+;;
+;; THE ENVIRONMENT CARRIES BIT PATTERNS, NOT DOUBLES. `[:map :string :f64]` is
+;; rejected today -- `direct floating map keys or values are outside the
+;; structured scalar ABI` -- so the map is `[:map :string :i64]` holding
+;; `f64-to-bits`. `f64-to-bits`/`f64-from-bits` are exact and total in both
+;; directions, so no value is lost and no rounding is introduced; NaN payloads
+;; and signed zero survive. **This is a current-state constraint of the ABI,
+;; not a design choice, and not a shape to imitate once maps admit f64.**
+;; `env-put` and `env-get` are the only two places that know it, so widening
+;; the ABI is a two-function change here.
+;;
+;; LAZINESS IS SEMANTICS, NOT OPTIMISATION. `IF` evaluates only the taken
+;; branch and `and`/`or` short-circuit, because `xmile.expr/eval-expr` does
+;; (Clojure's `and`/`or` are macros and its `:if` arm calls `go` on one branch).
+;; Evaluating eagerly would be observably different the moment the untaken side
+;; refers to an unbound identifier -- so those three are handled in the walk,
+;; where the operand trees are still trees, and not in `apply2`, which only
+;; ever sees numbers. There is a test for exactly this.
+
+(defn num-of [x :f64] [:ref :xmile/expr]
+  (variant-new [:ref :xmile/expr] :num x))
+
+(defn var-of [name :string] [:ref :xmile/expr]
+  (variant-new [:ref :xmile/expr] :var name))
+
+(defn app0-of [f :string] [:ref :xmile/expr]
+  (variant-new [:ref :xmile/expr] :app0 f))
+
+(defn app1-of [f :string a [:ref :xmile/expr]] [:ref :xmile/expr]
+  (variant-new [:ref :xmile/expr] :app1
+               (hetero-vector [:vector [:string [:ref :xmile/expr]]] f a)))
+
+(defn app2-of [f :string a [:ref :xmile/expr] b [:ref :xmile/expr]] [:ref :xmile/expr]
+  (variant-new [:ref :xmile/expr] :app2
+               (hetero-vector [:vector [:string [:ref :xmile/expr]
+                                        [:ref :xmile/expr]]] f a b)))
+
+(defn app3-of [f :string a [:ref :xmile/expr] b [:ref :xmile/expr]
+               c [:ref :xmile/expr]] [:ref :xmile/expr]
+  (variant-new [:ref :xmile/expr] :app3
+               (hetero-vector [:vector [:string [:ref :xmile/expr]
+                                        [:ref :xmile/expr]
+                                        [:ref :xmile/expr]]] f a b c)))
+
+;; --- results and the environment ------------------------------------------
+
+(defn ok [x :f64] [:result :f64 :string]
+  (result-ok-of [:result :f64 :string] x))
+
+(defn err [message :string] [:result :f64 :string]
+  (result-err-of [:result :f64 :string] message))
+
+(defn ok? [r [:result :f64 :string]] :bool
+  (result-ok?-of [:result :f64 :string] r))
+
+(defn value-of [r [:result :f64 :string]] :f64
+  (result-value-of [:result :f64 :string] r 0.0))
+
+(defn env-empty [] [:map :string :i64]
+  (typed-map-new [:map :string :i64]))
+
+(defn env-put [env [:map :string :i64] name :string value :f64] [:map :string :i64]
+  (typed-map-assoc [:map :string :i64] env name (f64-to-bits value)))
+
+;; `xmile.expr/resolve-ref`: the environment first, then the reserved constants
+;; PI and INF, then a failure naming the identifier. The order matters -- a
+;; model MAY bind a variable called PI, and then it wins.
+(defn env-get [env [:map :string :i64] name :string] [:result :f64 :string]
+  (if (typed-map-contains [:map :string :i64] env name)
+    (ok (f64-from-bits
+         (if-some [bits (typed-map-get [:map :string :i64] env name)] bits 0)))
+    (if (string=? name "PI")
+      (ok (pi))
+      (if (string=? name "INF")
+        (ok (inf))
+        (err (string-concat "xmile.expr: unknown identifier: " name))))))
+
+;; --- built-ins this evaluator refuses before looking at its arguments ------
+;; `xmile.expr/eval-expr` checks these two sets BEFORE evaluating the argument
+;; trees, so a bad argument inside `DELAY1(...)` is reported as DELAY1 and not
+;; as the argument. Reproduced here for the same reason: the refusal is about
+;; the call, so it must not depend on whether the arguments happen to evaluate.
+;; Returns "" when the name is not refused.
+
+(defn call-refusal [f :string] :string
+  (if (if (string=? f "RANDOM") true
+        (if (string=? f "NORMAL") true
+          (if (string=? f "EXPRND") true
+            (if (string=? f "LOGNORMAL") true
+              (if (string=? f "POISSON") true
+                (if (string=? f "DELAY") true
+                  (if (string=? f "DELAYN") true
+                    (if (string=? f "SMTHN") true
+                      (string=? f "FORCST")))))))))
+    (string-concat (string-concat "xmile.expr: " f)
+                   " is not yet implemented (v2 scope-out)")
+    (if (if (string=? f "DELAY1") true
+          (if (string=? f "DELAY3") true
+            (if (string=? f "SMTH1") true
+              (if (string=? f "SMTH3") true
+                (string=? f "TREND")))))
+      (string-concat (string-concat "xmile.expr: " f)
+                     (string-concat " requires model-level hidden-stock "
+                                    "desugaring (xmile.execute/desugar-delays)"))
+      "")))
+
+;; --- application ----------------------------------------------------------
+
+(defn apply0 [f :string] [:result :f64 :string]
+  (if (string=? f "PI") (ok (pi))
+    (if (string=? f "INF") (ok (inf))
+      (err (string-concat "xmile.expr: unknown function " f)))))
+
+(defn apply1 [f :string x :f64] [:result :f64 :string]
+  ;; sec 3.3 unary operators first, then the sec 3.5.1 one-argument built-ins.
+  (if (string=? f "neg") (ok (f64-neg x))
+    (if (string=? f "not") (ok (not-num x))
+      (if (string=? f "ABS") (ok (abs x))
+        (if (string=? f "SQRT") (ok (sqrt x))
+          (if (string=? f "EXP") (ok (exp x))
+            (if (string=? f "LN") (ok (ln x))
+              (if (string=? f "LOG10") (ok (log10 x))
+                (if (string=? f "SIN") (ok (sin x))
+                  (if (string=? f "COS") (ok (cos x))
+                    (if (string=? f "TAN") (ok (tan x))
+                      (if (string=? f "ARCSIN") (ok (arcsin x))
+                        (if (string=? f "ARCCOS") (ok (arccos x))
+                          (if (string=? f "ARCTAN") (ok (arctan x))
+                            (if (string=? f "INT") (ok (int-part x))
+                              (err (string-concat
+                                    "xmile.expr: unknown function " f)))))))))))))))))
+
+;; `and` / `or` are NOT here: they short-circuit, so they never reach a place
+;; where both operands are already numbers. See the walk.
+(defn apply2 [f :string a :f64 b :f64 env [:map :string :i64]] [:result :f64 :string]
+  (if (string=? f "add") (ok (f64-add a b))
+    (if (string=? f "sub") (ok (f64-sub a b))
+      (if (string=? f "mul") (ok (f64-mul a b))
+        (if (string=? f "div") (ok (f64-div a b))
+          (if (string=? f "mod") (ok (xmile-mod a b))
+            (if (string=? f "pow") (ok (pow a b))
+              (if (string=? f "lt") (ok (lt-num a b))
+                (if (string=? f "le") (ok (le-num a b))
+                  (if (string=? f "gt") (ok (gt-num a b))
+                    (if (string=? f "ge") (ok (ge-num a b))
+                      (if (string=? f "eq") (ok (eq-num a b))
+                        (if (string=? f "ne") (ok (ne-num a b))
+                          (if (string=? f "MIN") (ok (min-2 a b))
+                            (if (string=? f "MAX") (ok (max-2 a b))
+                              ;; sec 3.5.4 test inputs read the reserved
+                              ;; simulation-time bindings out of the same
+                              ;; environment the .cljc reads them from.
+                              (if (string=? f "STEP")
+                                (let [t (env-get env "TIME")]
+                                  (if (ok? t) (ok (step-value a b (value-of t))) t))
+                                (if (string=? f "RAMP")
+                                  (let [t (env-get env "TIME")]
+                                    (if (ok? t) (ok (ramp-value a b (value-of t))) t))
+                                  (if (string=? f "PULSE")
+                                    ;; Two-argument PULSE: interval 0 = fire once.
+                                    (let [t (env-get env "TIME")]
+                                      (if (ok? t)
+                                        (let [dt (env-get env "DT")]
+                                          (if (ok? dt)
+                                            (ok (pulse-value a b 0.0 (value-of t)
+                                                             (value-of dt)))
+                                            dt))
+                                        t))
+                                    (err (string-concat
+                                          "xmile.expr: unknown function "
+                                          f))))))))))))))))))))
+
+;; --- the walk -------------------------------------------------------------
+
+(defn eval-expr [e [:ref :xmile/expr] env [:map :string :i64]] [:result :f64 :string]
+  (match-variant e [:ref :xmile/expr]
+    (:num x (ok x))
+    (:var name (env-get env name))
+    (:app0 f (let [refusal (call-refusal f)]
+               (if (string=? refusal "") (apply0 f) (err refusal))))
+    (:app1 p
+     (let [f (hetero-vector-at [:vector [:string [:ref :xmile/expr]]] p 0)
+           refusal (call-refusal f)]
+       (if (string=? refusal "")
+         (let [a (eval-expr
+                  (hetero-vector-at [:vector [:string [:ref :xmile/expr]]] p 1) env)]
+           (if (ok? a) (apply1 f (value-of a)) a))
+         (err refusal))))
+    (:app2 p
+     (let [f (hetero-vector-at [:vector [:string [:ref :xmile/expr] [:ref :xmile/expr]]] p 0)
+           left (hetero-vector-at [:vector [:string [:ref :xmile/expr] [:ref :xmile/expr]]] p 1)
+           right (hetero-vector-at [:vector [:string [:ref :xmile/expr] [:ref :xmile/expr]]] p 2)
+           refusal (call-refusal f)]
+       (if (string=? refusal "")
+         ;; `and` and `or` short-circuit on the LEFT operand's truthiness and
+         ;; never evaluate the right one when the answer is already fixed.
+         (if (string=? f "and")
+           (let [a (eval-expr left env)]
+             (if (ok? a)
+               (if (truthy (value-of a))
+                 (let [b (eval-expr right env)]
+                   (if (ok? b) (ok (bool-num (truthy (value-of b)))) b))
+                 (ok 0.0))
+               a))
+           (if (string=? f "or")
+             (let [a (eval-expr left env)]
+               (if (ok? a)
+                 (if (truthy (value-of a))
+                   (ok 1.0)
+                   (let [b (eval-expr right env)]
+                     (if (ok? b) (ok (bool-num (truthy (value-of b)))) b)))
+                 a))
+             (let [a (eval-expr left env)]
+               (if (ok? a)
+                 (let [b (eval-expr right env)]
+                   (if (ok? b) (apply2 f (value-of a) (value-of b) env) b))
+                 a))))
+         (err refusal))))
+    (:app3 p
+     (let [f (hetero-vector-at [:vector [:string [:ref :xmile/expr] [:ref :xmile/expr]
+                        [:ref :xmile/expr]]] p 0)
+           first-arg (hetero-vector-at [:vector [:string [:ref :xmile/expr] [:ref :xmile/expr]
+                        [:ref :xmile/expr]]] p 1)
+           second-arg (hetero-vector-at [:vector [:string [:ref :xmile/expr] [:ref :xmile/expr]
+                        [:ref :xmile/expr]]] p 2)
+           third-arg (hetero-vector-at [:vector [:string [:ref :xmile/expr] [:ref :xmile/expr]
+                        [:ref :xmile/expr]]] p 3)
+           refusal (call-refusal f)]
+       (if (string=? refusal "")
+         ;; `IF cond THEN a ELSE b` (sec 3.3.3) evaluates one branch, not both.
+         (if (string=? f "if")
+           (let [c (eval-expr first-arg env)]
+             (if (ok? c)
+               (if (truthy (value-of c))
+                 (eval-expr second-arg env)
+                 (eval-expr third-arg env))
+               c))
+           (if (string=? f "PULSE")
+             (let [a (eval-expr first-arg env)]
+               (if (ok? a)
+                 (let [b (eval-expr second-arg env)]
+                   (if (ok? b)
+                     (let [c (eval-expr third-arg env)]
+                       (if (ok? c)
+                         (let [t (env-get env "TIME")]
+                           (if (ok? t)
+                             (let [dt (env-get env "DT")]
+                               (if (ok? dt)
+                                 (ok (pulse-value (value-of a) (value-of b)
+                                                  (value-of c) (value-of t)
+                                                  (value-of dt)))
+                                 dt))
+                             t))
+                         c))
+                     b))
+                 a))
+             (err (string-concat "xmile.expr: unknown function " f))))
+         (err refusal))))))
