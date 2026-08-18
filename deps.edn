@@ -10,7 +10,7 @@
                       ;; kotoba-lang/amu is a TEST-ONLY dependency, for the
                       ;; parity gate that compiles kotoba/xmile_expr_core.kotoba
                       ;; and requires it to reproduce xmile.expr's numbers
-                      ;; (root ADR-2608180200). The library itself has no
+                      ;; (root ADR-2608189400). The library itself has no
                       ;; runtime dependency on it, and no .cljc under src/ is
                       ;; removed or changed by the port -- the same boundary
                       ;; kotoba-lang/css and kotoba-lang/dsl-core draw.
