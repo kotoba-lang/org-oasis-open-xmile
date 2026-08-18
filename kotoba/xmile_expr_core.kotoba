@@ -21,7 +21,13 @@
       [:app1 [:vector [:string [:ref :xmile/expr]]]]
       [:app2 [:vector [:string [:ref :xmile/expr] [:ref :xmile/expr]]]]
       [:app3 [:vector [:string [:ref :xmile/expr] [:ref :xmile/expr]
-                       [:ref :xmile/expr]]]]]]})
+                       [:ref :xmile/expr]]]]]]
+
+    ;; A list of variable names -- a stock's inflows or its outflows.
+    :xmile/names
+    [:variant :xmile/names
+     [[:end :i64]
+      [:cons [:vector [:string [:ref :xmile/names]]]]]]})
   (:export [abs sqrt exp ln log10 sin cos tan arcsin arccos arctan
             floor int-part pow xmile-mod min-2 max-2 pi inf
             truthy bool-num not-num and-num or-num
@@ -29,7 +35,9 @@
             step-value ramp-value pulse-value
             num-of var-of app0-of app1-of app2-of app3-of
             env-empty env-put env-get
-            call-refusal apply0 apply1 apply2 eval-expr]))
+            call-refusal apply0 apply1 apply2 eval-expr
+            names-end names-cons clamp-non-negative
+            eval-into sum-of derivative-of advance rk4-weight]))
 
 ;; The scalar decision core of `xmile.expr` (OASIS XMILE 1.0 sec 3.3/3.5),
 ;; written in Kotoba. `kotoba/pure`: no capabilities, no ambient authority,
@@ -482,3 +490,105 @@
                  a))
              (err (string-concat "xmile.expr: unknown function " f))))
          (err refusal))))))
+
+
+;; ==========================================================================
+;; One simulation step (sec 3.7.1 Euler / RK4), over the same values.
+;; ==========================================================================
+;;
+;; `xmile.execute` does five things. Three of them are XMILE decisions and are
+;; here; two are bookkeeping about the model and stay in `.cljc`.
+;;
+;;   here   bind one non-stock variable's value into the environment, clamped
+;;          (sec 3.1.2); take a stock's inflows minus its outflows (sec 3.1.1);
+;;          advance a stock by Euler or classical RK4.
+;;
+;;   .cljc  DERIVING the evaluation order (`topo-order` is a graph colouring
+;;          over the model, and it is what proves there is no algebraic loop --
+;;          a different kind of claim from anything below), `desugar-delays`,
+;;          `constant-names`, `assert-executable!`, the time loop, and the
+;;          ITERATION over variables and over stocks.
+;;
+;; WHY THE ITERATION IS NOT HERE -- MEASURED, NOT ASSUMED. The first version of
+;; this section took the whole evaluation plan and the whole stock table as
+;; recursive values, one call per step. It does not fit. A value crossing this
+;; boundary is validated against fixed budgets in `kotoba.kir.value` --
+;; `adt-node-limit` 64, `adt-depth-limit` 12, `typed-map-entry-limit` 31 -- and
+;; a linked list of N variables is N deep, so a model of any size is rejected
+;; outright (`ADT value exceeds node limit`). The failure is clean: the
+;; boundary refuses and nothing computes a wrong number. But it is a real
+;; ceiling, so the shape here is one call per quantity, whose arguments are
+;; bounded by the PROBLEM -- one variable, one stock's flow list -- rather than
+;; by how large the model is.
+;;
+;; That is a current-state constraint, not a design principle. `adt-depth-limit`
+;; has already been raised once (8 -> 12, kotoba-kir ADR 0025); nothing here is
+;; an argument that model-sized values are the wrong shape.
+;;
+;; Every function that can fail returns `[:result … :string]` for the same
+;; reason `eval-expr` does, and threads a subexpression's failure out.
+
+(defn names-end [] [:ref :xmile/names]
+  (variant-new [:ref :xmile/names] :end 0))
+
+(defn names-cons [name :string rest [:ref :xmile/names]] [:ref :xmile/names]
+  (variant-new [:ref :xmile/names] :cons
+               (hetero-vector [:vector [:string [:ref :xmile/names]]] name rest)))
+
+;; sec 3.1.2: a variable declared non-negative never reports a negative value.
+(defn clamp-non-negative [non-negative :bool x :f64] :f64
+  (if non-negative (f64-max 0.0 x) x))
+
+;; The body of `xmile.execute/eval-non-stocks`' fold: evaluate one variable's
+;; equation against the environment built so far, clamp it, bind it. The order
+;; is the caller's input -- nothing here can or should guess one.
+(defn eval-into [name :string equation [:ref :xmile/expr] non-negative :bool
+                 env [:map :string :i64]]
+  [:result [:map :string :i64] :string]
+  (let [value (eval-expr equation env)]
+    (if (ok? value)
+      (result-ok-of [:result [:map :string :i64] :string]
+                    (env-put env name
+                             (clamp-non-negative non-negative (value-of value))))
+      (result-err-of [:result [:map :string :i64] :string]
+                     (result-error-of [:result :f64 :string] value "")))))
+
+;; The .cljc sums `(reduce + 0.0 (map #(get env %) inflows))` in the set's own
+;; iteration order. Floating-point addition is not associative, so the caller
+;; passes the names in that order and this adds them in it -- which is why a
+;; three-inflow stock agrees bit-for-bit and not merely closely.
+(defn sum-of [names [:ref :xmile/names] env [:map :string :i64] acc :f64]
+  [:result :f64 :string]
+  (match-variant names [:ref :xmile/names]
+    (:end z (ok acc))
+    (:cons p
+     (let [name (hetero-vector-at [:vector [:string [:ref :xmile/names]]] p 0)
+           value (env-get env name)]
+       (if (ok? value)
+         (sum-of (hetero-vector-at [:vector [:string [:ref :xmile/names]]] p 1)
+                 env (f64-add acc (value-of value)))
+         value)))))
+
+;; sec 3.1.1: d(stock)/dt is the sum of a stock's inflows minus the sum of its
+;; outflows, each already clamped by `eval-into`.
+(defn derivative-of [inflows [:ref :xmile/names] outflows [:ref :xmile/names]
+                     env [:map :string :i64]] [:result :f64 :string]
+  (let [in (sum-of inflows env 0.0)]
+    (if (ok? in)
+      (let [out (sum-of outflows env 0.0)]
+        (if (ok? out) (ok (f64-sub (value-of in) (value-of out))) out))
+      in)))
+
+;; `xmile.execute/vec+`, for one stock: y + scale*k. Euler is this once at
+;; scale = dt; RK4 uses it for its three intermediate states (dt/2, dt/2, dt)
+;; and once more at dt/6 for the combination. One operation, five uses.
+(defn advance [y :f64 k :f64 scale :f64] :f64
+  (f64-add y (f64-mul scale k)))
+
+;; Classical RK4's weighting, ((k1 + 2k2) + 2k3) + k4, in the .cljc's own
+;; left-to-right association order so that `advance y (rk4-weight …) (dt/6)`
+;; is bit-identical to `(+ y (* (/ dt 6.0) (+ k1 (* 2 k2) (* 2 k3) k4)))` and
+;; not merely close. The parity gate asserts equality over whole RK4
+;; trajectories, and a reassociated sum would not survive that.
+(defn rk4-weight [k1 :f64 k2 :f64 k3 :f64 k4 :f64] :f64
+  (f64-add (f64-add (f64-add k1 (f64-mul 2.0 k2)) (f64-mul 2.0 k3)) k4))

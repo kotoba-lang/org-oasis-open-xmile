@@ -34,7 +34,7 @@ parser dependency (host injects a parsed XML tree; see `xmile.xml`).
 | Simulation | scalar stocks, `:euler`/`:rk4`, non-negative clamping, sec 3.5.3 hidden-stock built-ins; parameters (variable-free auxes) evaluated once per run, not once per sub-step; conveyor/queue transport and arrays are not yet simulated (v2) |
 | Tests | round-trip/property coverage for every namespace; analytic (closed-form-vs-simulated) verification for the exponential-delay/smooth/Erlang-3/trend built-ins |
 | Runtime deps | `kotoba-lang/dsl-core` (validation-problem convention) only |
-| Kotoba | all of `xmile.expr/eval-expr` -- the scalar operations and the tree walk -- ported to `kotoba/xmile_expr_core.kotoba` and held to `xmile.expr` by two parity gates; the parser and `xmile.execute` are not ported; `.cljc` remains the authority and the load path |
+| Kotoba | the equation language and every number in a simulation step ported to `kotoba/xmile_expr_core.kotoba`, held to `xmile.expr`/`xmile.execute` by three parity gates; the parser, the dependency ordering and the time loop are not ported; `.cljc` remains the authority and the load path |
 
 ## Namespaces
 
@@ -136,6 +136,9 @@ profile -- no capabilities, no ambient authority. It is **the whole of
   `[:result :f64 :string]`. Errors are values here, not exceptions: that is one
   of the two constraints this language holds as permanent rather than
   provisional.
+- **the simulation step** -- binding one non-stock variable's clamped value
+  into the environment (sec 3.1.2), taking a stock's inflows minus its outflows
+  (sec 3.1.1), and the Euler and RK4 state updates (sec 3.7.1).
 
 The walk preserves the parts of `eval-expr` that are *semantics* rather than
 implementation: `IF` evaluates one branch, `AND`/`OR` short-circuit, a refused
@@ -144,9 +147,24 @@ the environment is consulted before the reserved `PI`/`INF` table so a model
 that binds `PI` gets its own value. Each of those is a separate test, and each
 was shown to turn the gate red on its own.
 
-What is still `.cljc`: the tokenizer and parser (`xmile.expr/parse`),
-`xmile.xml`, `xmile.validate` and `xmile.execute`. A model still cannot be
-simulated without a JVM or a JavaScript engine -- what moved is the evaluator.
+What is still `.cljc`, and on purpose: the tokenizer and parser
+(`xmile.expr/parse`), `xmile.xml`, `xmile.validate`, and -- inside
+`xmile.execute` -- `topo-order`, `desugar-delays`, `constant-names`, the time
+loop, and the iteration over variables and stocks. Deriving the evaluation
+order is a graph colouring that also proves the model has no algebraic loop; it
+is a different kind of claim from anything the port makes.
+
+A model still cannot be simulated without a JVM or a JavaScript engine. What
+moved is every number in a simulation step.
+
+One measured ceiling, stated because it is the honest limit of the third
+bullet: a value crossing this boundary is checked against fixed budgets
+(`adt-node-limit` 64, `adt-depth-limit` 12, `typed-map-entry-limit` 31), and a
+linked list costs two levels per link, so **a list of six names is refused**.
+The port therefore takes one call per quantity rather than one per step, and a
+stock with six or more inflows cannot have them summed in one call. The failure
+is clean -- the boundary refuses, nothing computes a wrong number -- and there
+is a test that pins the number so it cannot drift quietly.
 
 One current-state note, because it is a constraint and not a design choice: the
 environment holds `f64-to-bits` patterns in a `[:map :string :i64]` because
@@ -164,6 +182,14 @@ the same JVM, asserting against the real `xmile.expr`:
 - `test/xmile/kotoba_eval_expr_parity_test.clj` -- the walk. Every case there
   starts from an equation *string* and runs the real `xmile.expr/parse` over it,
   so the trees under test are the ones the parser actually produces.
+- `test/xmile/kotoba_simulation_parity_test.clj` -- the step. This one is
+  `xmile.execute/run`'s own loop with every number in it coming from the port,
+  asserted against `xmile.execute/run` over whole trajectories: five models,
+  every recorded variable at every recorded time, and equality rather than a
+  tolerance wherever no transcendental is involved -- RK4 included. A
+  *mathematically identical* reassociation of the RK4 weighting turns exactly
+  the two RK4 models red and leaves the Euler ones green, which is what makes
+  the bit-exactness claim mean something.
 
 Both keep the same two halves apart -- exactly where the two agree, and exactly
 where they do not:
@@ -190,6 +216,7 @@ the port is shaped around avoiding it.
 ```bash
 clojure -M:test -n xmile.kotoba-expr-core-parity-test
 clojure -M:test -n xmile.kotoba-eval-expr-parity-test
+clojure -M:test -n xmile.kotoba-simulation-parity-test
 ```
 
 ## Follow-ups (v2, out of scope for this landing)
