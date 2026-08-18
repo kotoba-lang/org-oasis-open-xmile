@@ -6,7 +6,17 @@
  {:conformance {:main-opts ["-m" "xmile.conformance"]}
   :test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner
-                      {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+                      {:git/tag "v0.5.1" :git/sha "dfb30dd"}
+                      ;; kotoba-lang/amu is a TEST-ONLY dependency, for the
+                      ;; parity gate that compiles kotoba/xmile_expr_core.kotoba
+                      ;; and requires it to reproduce xmile.expr's numbers
+                      ;; (root ADR-2608180200). The library itself has no
+                      ;; runtime dependency on it, and no .cljc under src/ is
+                      ;; removed or changed by the port -- the same boundary
+                      ;; kotoba-lang/css and kotoba-lang/dsl-core draw.
+                      io.github.kotoba-lang/amu
+                      {:git/url "https://github.com/kotoba-lang/amu.git"
+                       :git/sha "29e8386aa4d6a24d0ade6617aaac763af330179c"}}
          :main-opts ["-m" "cognitect.test-runner"]
          :exec-fn cognitect.test-runner.api/test}
   :lint {:replace-deps {clj-kondo/clj-kondo {:mvn/version "2024.11.14"}}

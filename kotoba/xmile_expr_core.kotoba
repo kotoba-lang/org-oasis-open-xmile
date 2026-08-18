@@ -1,0 +1,182 @@
+(ns xmile-expr-core
+  (:export [abs sqrt exp ln log10 sin cos tan arcsin arccos arctan
+            floor int-part pow xmile-mod min-2 max-2 pi inf
+            truthy bool-num not-num and-num or-num
+            lt-num le-num gt-num ge-num eq-num ne-num
+            step-value ramp-value pulse-value]))
+
+;; The scalar decision core of `xmile.expr` (OASIS XMILE 1.0 sec 3.3/3.5),
+;; written in Kotoba. `kotoba/pure`: no capabilities, no ambient authority,
+;; f64 in and f64 out.
+;;
+;; WHY THIS FILE EXISTS. `src/xmile/expr.cljc` binds every one of XMILE's
+;; sec 3.5.1 math built-ins to a HOST function -- `Math/exp` on the JVM,
+;; `js/Math.exp` on ClojureScript, sixteen reader conditionals in all. That is
+;; the whole of XMILE's numeric semantics resting on an interop call. This
+;; module carries the same semantics with no host math library underneath it:
+;; the kernels are fixed polynomials in the compiler's own f64 intrinsics
+;; (amu docs/adr/0009 wide-angle trigonometry, 0012 wide exp/log), which is
+;; why the two agree to ~1e-15 rather than bit-for-bit -- see the parity gate.
+;;
+;; WHAT IS NOT HERE, AND WHY. Expression-TREE walking and the `{"Name" value}`
+;; environment stay in `.cljc`. This is the decision-core shape the workspace
+;; rule prescribes (root CLAUDE.md, "移行の単位は決定核"): scalars and records
+;; cross, collection assembly does not. `xmile.expr/eval-expr` dispatches on a
+;; recursive tree and looks names up in a map; every ARM of that dispatch that
+;; carries real XMILE semantics -- rather than plain IEEE arithmetic -- is a
+;; function below.
+;;
+;; AUTHORITY. `src/xmile/expr.cljc` remains the authority and the load path,
+;; unchanged and unremoved. This file proves the logic is expressible; it does
+;; not replace it. Root ADR-2608130900 records what happens when a `.kotoba`
+;; migration removes the `.cljc` a consumer loads: this repository was one of
+;; the twelve left without a load path for 23 days, so the css shape (two
+;; files, one parity gate) is the one followed here.
+;;
+;; BACKENDS. Qualified on `:kotoba-wasm` and `:kotoba-script` today, which is
+;; where the f64 transcendental intrinsics are emitted. The two native
+;; backends emit f64 arithmetic (add/sub/mul/div/min/max/sqrt/abs/neg, and
+;; vector-f64) but no exp/log/sin/cos/atan2 -- measured 2026-08-18 by reading
+;; the op tables in `kotoba-native/src/kotoba/native/{x86_64,aarch64}.cljc`.
+;; That is an implementation gap in a backend, NOT a ceiling of this language
+;; (`amu/resources/kotoba/lang/application-language.edn`, `:backend-
+;; qualification :rule`), so nothing below is shaped around avoiding it.
+;;
+;; DOMAINS. Every function here is total on the domain named in its own
+;; comment and TRAPS outside it -- fail-closed, rather than returning a number
+;; nobody should trust. Where that domain is narrower than the host `Math/*`
+;; call it replaces, the difference is stated at the function and pinned by a
+;; test. Errors are traps, not exceptions: this profile has no `throw`, and
+;; the domains below are the intrinsics' own, so a `[:result :f64 :string]`
+;; return would re-wrap a decision the intrinsic already makes.
+
+;; --- constants ------------------------------------------------------------
+
+(defn pi [] :f64 3.141592653589793)
+
+;; XMILE's INF (sec 3.5.1). `f64-div` follows IEEE-754 here exactly as the
+;; host does, so this is +Inf and not a trap.
+(defn inf [] :f64 (f64-div 1.0 0.0))
+
+(defn ln-10 [] :f64 2.302585092994046)
+
+;; --- sec 3.5.1 math built-ins ---------------------------------------------
+
+(defn abs [x :f64] :f64 (f64-abs x))
+
+;; Matches `Math/sqrt`, including NaN for a negative argument.
+(defn sqrt [x :f64] :f64 (f64-sqrt x))
+
+;; Domain |x| <= 512*ln(2) ~= 354.891. Outside it this traps where the host
+;; `Math/exp` would saturate to 0 or +Inf.
+(defn exp [x :f64] :f64 (f64-exp-bounded x))
+
+;; Domain [2^-512, 2^512]. `Math/log` returns -Inf at 0 and NaN below it;
+;; here both trap.
+(defn ln [x :f64] :f64 (f64-log-bounded x))
+
+(defn log10 [x :f64] :f64 (f64-div (f64-log-bounded x) (ln-10)))
+
+;; Domain |x| <= 8192*pi. Beyond that the host reduces the angle with a
+;; precision nobody can defend, so this refuses instead.
+(defn sin [x :f64] :f64 (f64-sin-bounded x))
+
+(defn cos [x :f64] :f64 (f64-cos-bounded x))
+
+;; sin/cos rather than a separate kernel: at a pole cos is +-0.0 and the
+;; quotient is +-Inf, which is what `Math/tan` returns for the same input
+;; (it never returns exactly +-Inf, but both are numerically meaningless
+;; there and neither is trusted by a model).
+(defn tan [x :f64] :f64 (f64-div (f64-sin-bounded x) (f64-cos-bounded x)))
+
+(defn arctan [x :f64] :f64 (f64-atan2-bounded x 1.0))
+
+;; arcsin/arccos through atan2 on the unit circle. For |x| > 1 the half-chord
+;; is sqrt of a negative, i.e. NaN, and `f64-atan2-bounded` traps on NaN --
+;; where `Math/asin` would hand back a NaN that flows on into the model.
+(defn arcsin [x :f64] :f64
+  (f64-atan2-bounded x (f64-sqrt (f64-sub 1.0 (f64-mul x x)))))
+
+(defn arccos [x :f64] :f64
+  (f64-atan2-bounded (f64-sqrt (f64-sub 1.0 (f64-mul x x))) x))
+
+;; Floored, matching `Math/floor`. Defined for |x| < 2^63: the truncation
+;; intrinsic traps on NaN, the infinities and anything out of i64 range.
+(defn floor [x :f64] :f64
+  (let [truncated (i64-to-f64-rounded (f64-to-i64-truncating x))]
+    (if (f64-lt x truncated) (f64-sub truncated 1.0) truncated)))
+
+;; XMILE INT (sec 3.5.1) is `Math/floor` in the .cljc original, not truncation.
+(defn int-part [x :f64] :f64 (floor x))
+
+(defn min-2 [a :f64 b :f64] :f64 (f64-min a b))
+(defn max-2 [a :f64 b :f64] :f64 (f64-max a b))
+
+;; FLOORED modulus, matching `clojure.core/mod` (which is what the .cljc uses)
+;; and not `rem`: (xmile-mod -1.0 3.0) is 2.0, not -1.0. XMILE's MOD is an
+;; operator, not a call (sec 3.3.1).
+(defn xmile-mod [a :f64 n :f64] :f64
+  (f64-sub a (f64-mul n (floor (f64-div a n)))))
+
+;; `^` (sec 3.3.1). Reconstructed from exp/log rather than a host `pow`, so
+;; the three cases the host handles by convention are handled explicitly:
+;;   base > 0  exp(e * ln base), inside the exp/log domains above
+;;   base = 0  0^e is 0 for e>0, 1 for e=0, +Inf for e<0 (as `Math/pow`)
+;;   base < 0  defined only for integral e (as `Math/pow`); NaN otherwise
+(defn pow [base :f64 e :f64] :f64
+  (if (f64-gt base 0.0)
+    (f64-exp-bounded (f64-mul e (f64-log-bounded base)))
+    (if (f64-eq base 0.0)
+      (if (f64-gt e 0.0)
+        0.0
+        (if (f64-eq e 0.0) 1.0 (f64-div 1.0 0.0)))
+      (if (f64-eq e (floor e))
+        (let [magnitude (f64-exp-bounded (f64-mul e (f64-log-bounded (f64-neg base))))]
+          (if (f64-eq (xmile-mod e 2.0) 0.0) magnitude (f64-neg magnitude)))
+        (f64-div 0.0 0.0)))))
+
+;; --- sec 3.3 node semantics -----------------------------------------------
+;; XMILE has no boolean type: conditions and relational operators are numbers,
+;; zero is false and every other value -- NaN included, matching `zero?` --
+;; is true. These are the arms of `eval-expr` that are XMILE semantics rather
+;; than plain IEEE arithmetic, which is why `+`/`-`/`*`/`/` have no wrapper
+;; here and these do.
+
+(defn truthy [x :f64] :bool (bool-not (f64-eq x 0.0)))
+
+(defn bool-num [b :bool] :f64 (if b 1.0 0.0))
+
+(defn not-num [x :f64] :f64 (bool-num (bool-not (truthy x))))
+(defn and-num [a :f64 b :f64] :f64 (bool-num (if (truthy a) (truthy b) false)))
+(defn or-num  [a :f64 b :f64] :f64 (bool-num (if (truthy a) true (truthy b))))
+
+(defn lt-num [a :f64 b :f64] :f64 (bool-num (f64-lt a b)))
+(defn le-num [a :f64 b :f64] :f64 (bool-num (f64-le a b)))
+(defn gt-num [a :f64 b :f64] :f64 (bool-num (f64-gt a b)))
+(defn ge-num [a :f64 b :f64] :f64 (bool-num (f64-ge a b)))
+(defn eq-num [a :f64 b :f64] :f64 (bool-num (f64-eq a b)))
+(defn ne-num [a :f64 b :f64] :f64 (bool-num (bool-not (f64-eq a b))))
+
+;; --- sec 3.5.4 test inputs ------------------------------------------------
+;; The .cljc reads TIME and DT out of the environment map; here they are
+;; ordinary parameters, which is the whole difference between a map lookup
+;; and a decision core.
+
+(defn step-value [height :f64 start :f64 t :f64] :f64
+  (if (f64-ge t start) height 0.0))
+
+(defn ramp-value [slope :f64 start :f64 t :f64] :f64
+  (if (f64-lt t start) 0.0 (f64-mul slope (f64-sub t start))))
+
+;; PULSE(magnitude, first-time[, interval]): one DT wide, magnitude/DT high,
+;; at first-time and every interval thereafter. A non-positive interval fires
+;; once -- the .cljc caller passes 0.0 for the two-argument form.
+(defn pulse-value [magnitude :f64 first-time :f64 interval :f64
+                   t :f64 dt :f64] :f64
+  (if (f64-lt t (f64-sub first-time (f64-div dt 2.0)))
+    0.0
+    (if (f64-le interval 0.0)
+      (if (f64-lt (f64-sub t first-time) dt) (f64-div magnitude dt) 0.0)
+      (if (f64-lt (xmile-mod (f64-sub t first-time) interval) dt)
+        (f64-div magnitude dt)
+        0.0))))

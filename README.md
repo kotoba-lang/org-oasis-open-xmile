@@ -34,6 +34,7 @@ parser dependency (host injects a parsed XML tree; see `xmile.xml`).
 | Simulation | scalar stocks, `:euler`/`:rk4`, non-negative clamping, sec 3.5.3 hidden-stock built-ins; parameters (variable-free auxes) evaluated once per run, not once per sub-step; conveyor/queue transport and arrays are not yet simulated (v2) |
 | Tests | round-trip/property coverage for every namespace; analytic (closed-form-vs-simulated) verification for the exponential-delay/smooth/Erlang-3/trend built-ins |
 | Runtime deps | `kotoba-lang/dsl-core` (validation-problem convention) only |
+| Kotoba | scalar decision core of `xmile.expr` ported to `kotoba/xmile_expr_core.kotoba` and held to `xmile.expr` by a parity gate; `.cljc` remains the authority and the load path |
 
 ## Namespaces
 
@@ -111,6 +112,56 @@ adds the hidden stock(s) internally:
 
 (get-in (execute/run perceived) [:xmile/series "Perceived_Rate"])
 ;=> [0.0 0.0 ... exponentially approaches 10.0 after t=2]
+```
+
+## Kotoba decision core
+
+`src/xmile/expr.cljc` binds every one of XMILE's sec 3.5.1 math built-ins to a
+host function -- `Math/exp` on the JVM, `js/Math.exp` on ClojureScript, sixteen
+reader conditionals in all. That is the whole of XMILE's numeric semantics
+resting on interop, and it is why the equation language could not be evaluated
+anywhere but a JVM or a JavaScript engine.
+
+`kotoba/xmile_expr_core.kotoba` carries the same semantics with no host math
+library underneath it: the transcendentals are fixed polynomial kernels in the
+Kotoba compiler's own f64 intrinsics, and the module sits in the `kotoba/pure`
+profile -- no capabilities, no ambient authority, f64 in and f64 out. It covers
+the sec 3.5.1 math built-ins, `^` and floored `MOD`, all six relational and
+three logical operators (XMILE has no boolean type; zero is false), and the sec
+3.5.4 `STEP`/`RAMP`/`PULSE` test inputs.
+
+Expression-*tree* walking and the `{"Name" value}` environment stay in `.cljc`.
+Scalars cross; collection assembly does not. That boundary is the point of the
+split, not a temporary state of it.
+
+**`src/xmile/expr.cljc` is unchanged, and remains both the authority and the
+thing consumers load.** The port proves the logic is expressible; it does not
+replace it. `test/xmile/kotoba_expr_core_parity_test.clj` compiles the port and
+runs it through the KIR interpreter in the same JVM, asserting against the real
+`xmile.expr/eval-expr` -- exactly where the two agree, and exactly where they
+do not:
+
+- **exact** -- `ABS` `SQRT` `INT` `MIN` `MAX` `MOD`, the relational and logical
+  operators, `PI` `INF`, `STEP` `RAMP` `PULSE`. A one-ulp difference here would
+  be a defect.
+- **within 1e-12 relative** -- `EXP` `LN` `LOG10` `SIN` `COS` `TAN` `ARCSIN`
+  `ARCCOS` `ARCTAN` and `^`. Bit equality is not available against a host math
+  library and claiming it would be a lie; the worst error observed across the
+  corpus is 1.276e-13 (`TAN` at 1000.25, where sin's and cos's wide-angle
+  reduction errors compound through the quotient). Every run prints the table.
+- **narrower on purpose** -- the port traps where the host returns a non-finite
+  value (`LN(0)`, `EXP(1000)`, `ARCSIN(2)`), which is fail-closed and better,
+  and *also* traps beyond `|angle| <= 8192*pi` where `Math/sin` reduces fine,
+  which is a gap in the port and is pinned as one.
+
+Qualified today on the `kotoba-wasm` and `kotoba-script` backends, which is
+where the f64 transcendental intrinsics are emitted. The two native backends
+emit f64 arithmetic but no `exp`/`log`/`sin`/`cos`/`atan2`; that is an
+implementation gap in a backend, not a ceiling of the language, so nothing in
+the port is shaped around avoiding it.
+
+```bash
+clojure -M:test -n xmile.kotoba-expr-core-parity-test
 ```
 
 ## Follow-ups (v2, out of scope for this landing)
