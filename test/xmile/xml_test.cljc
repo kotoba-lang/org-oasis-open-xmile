@@ -114,7 +114,14 @@
         text (xml/emit-string doc)]
     (is (re-find #"xmlns=\"http://docs.oasis-open.org/xmile/ns/XMILE/v1.0\"" text))
     (is (re-find #"kotoba &amp; lang" text))
-    (is (= doc (xml/parse-string text)))))
+    ;; `emit-string` is portable; `parse-string` is the file-content
+    ;; boundary and is `:clj`-only (javax.xml), exactly as this namespace's
+    ;; docstring says. Left unguarded it did not fail on ClojureScript by
+    ;; saying so -- it threw `undefined is not a constructor`, which reads
+    ;; as a runner defect rather than as the boundary it is. The portable
+    ;; tree round-trip (`parse-doc`/`emit-doc`) is covered above and runs on
+    ;; both runtimes.
+    #?(:clj (is (= doc (xml/parse-string text))))))
 
 #?(:clj
    (deftest xml-parser-rejects-doctype
