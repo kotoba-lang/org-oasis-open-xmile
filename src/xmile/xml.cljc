@@ -14,7 +14,7 @@
   'any software which supports XMILE should be able to simulate all
   whole-models, even those without diagrams', so the display layer is out
   of scope here (see README Follow-ups)."
-  (:require [clojure.string :as str])
+  (:require [kotoba.lang.text :as str])
   #?(:clj
      (:import (java.io StringReader)
               (javax.xml XMLConstants)
@@ -175,7 +175,7 @@
       (if (= "true" (attr (first-child e :dt) :reciprocal))
         (assoc ss :xmile/dt-reciprocal? true)
         ss))
-    (attr e :method) (assoc :xmile/method (keyword (str/lower-case (attr e :method))))
+    (attr e :method) (assoc :xmile/method (keyword (str/lower (attr e :method))))
     (attr e :time_units) (assoc :xmile/time-units (attr e :time_units))
     (attr e :pause) (assoc :xmile/pause (attr e :pause))))
 
@@ -197,7 +197,7 @@
 (defn- nums->csv [ns] (str/join "," (map num->str ns)))
 
 (defn parse-gf [e]
-  (cond-> {:xmile/gf-type (keyword (str/lower-case (or (attr e :type) "continuous")))}
+  (cond-> {:xmile/gf-type (keyword (str/lower (or (attr e :type) "continuous")))}
     (child-text e :ypts) (assoc :xmile/ypts (parse-csv-nums (child-text e :ypts)))
     (child-text e :xpts) (assoc :xmile/xpts (parse-csv-nums (child-text e :xpts)))
     (first-child e :xscale)
@@ -231,7 +231,7 @@
            (cond-> {:xmile/kind :stock
                     :xmile/inflows (set inflows)
                     :xmile/outflows (set outflows)
-                    :xmile/stock-type (keyword (str/lower-case (or (attr e :type) "stock")))}
+                    :xmile/stock-type (keyword (str/lower (or (attr e :type) "stock")))}
              ;; Priority is semantically significant for queues, conveyors and
              ;; constrained/non-negative stocks (XMILE 1.0 sec 4.2). Keep the
              ;; compact set API, but retain non-canonical wire order explicitly.

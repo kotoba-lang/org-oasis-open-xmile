@@ -17,7 +17,7 @@
   `delay-smooth-problems` below checks it's a structurally usable call
   (right argument count; a positive delay/smoothing/averaging-time where
   that argument is a literal constant)."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [clojure.set :as set]
             [kotoba.dsl.problem :as problem]
             [xmile.model :as m]

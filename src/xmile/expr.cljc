@@ -34,7 +34,7 @@
   (XMILE's built-in simulation-time variables) -- callers (xmile.execute)
   must supply them alongside ordinary variable bindings."
   (:refer-clojure :exclude [mod parse-double])
-  (:require [clojure.string :as str]))
+  (:require [kotoba.lang.text :as str]))
 
 ;; --- portable math shims ---
 
@@ -72,7 +72,7 @@
                  ws nil
                  quoted {:type :ident :value (subs quoted 1 (dec (count quoted)))}
                  num    {:type :num :value (parse-double num)}
-                 ident  (let [up (str/upper-case ident)]
+                 ident  (let [up (str/upper ident)]
                           (if (contains? keyword-tokens up)
                             {:type :kw :value up}
                             {:type :ident :value ident}))
@@ -133,7 +133,7 @@
       (let [nm (:value tok) toks (rest toks)]
         (if (op? (peek-tok toks) "(")
           (let [[args toks] (parse-args (rest toks))]
-            [[:call (str/upper-case nm) args] toks])
+            [[:call (str/upper nm) args] toks])
           [[:ref nm] toks]))
 
       :else (throw (ex-info "xmile.expr: unexpected token" {:token tok})))))
