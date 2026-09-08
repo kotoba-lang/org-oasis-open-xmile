@@ -13,7 +13,7 @@
   below (`run` calls it once up front) -- see that function's docstring for
   the exact construction and spec/Vensim citations."
   (:require [clojure.set :as set]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [xmile.model :as m]
             [xmile.expr :as expr]))
 
@@ -297,7 +297,7 @@
             (case fn-name
               ("DELAY1" "SMTH1")
               (let [[input time-arg init-arg] args
-                    nm (str "__" (str/lower-case fn-name) "_" id)
+                    nm (str "__" (str/lower fn-name) "_" id)
                     flow-nm (str nm "_flow")
                     init-tree (or init-arg input)]
                 (add! (m/stock nm init-tree {:xmile/inflows #{flow-nm}}))
@@ -306,7 +306,7 @@
 
               ("DELAY3" "SMTH3")
               (let [[input time-arg init-arg] args
-                    base (str "__" (str/lower-case fn-name) "_" id)
+                    base (str "__" (str/lower fn-name) "_" id)
                     dl [:div time-arg [:num 3.0]]
                     init-tree (or init-arg input)
                     s1 (str base "_1") s2 (str base "_2") s3 (str base "_3")
