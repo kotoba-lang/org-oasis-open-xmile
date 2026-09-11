@@ -214,9 +214,9 @@ implementation gap in a backend, not a ceiling of the language, so nothing in
 the port is shaped around avoiding it.
 
 ```bash
-clojure -M:test -n xmile.kotoba-expr-core-parity-test
-clojure -M:test -n xmile.kotoba-eval-expr-parity-test
-clojure -M:test -n xmile.kotoba-simulation-parity-test
+kbb -M:test -n xmile.kotoba-expr-core-parity-test
+kbb -M:test -n xmile.kotoba-eval-expr-parity-test
+kbb -M:test -n xmile.kotoba-simulation-parity-test
 ```
 
 ## Follow-ups (v2, out of scope for this landing)
@@ -259,8 +259,8 @@ clojure -M:test -n xmile.kotoba-simulation-parity-test
 ## Test
 
 ```bash
-clojure -M:test
-clojure -M:conformance  # official OASIS XMILE 1.0 XSD
+kbb -M:test
+kbb -M:conformance  # official OASIS XMILE 1.0 XSD
 ```
 
 See [`MATURITY.md`](MATURITY.md) for denominator-based percentages. XSD
