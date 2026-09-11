@@ -43,7 +43,7 @@
 ;; written in Kotoba. `kotoba/pure`: no capabilities, no ambient authority,
 ;; f64 in and f64 out.
 ;;
-;; WHY THIS FILE EXISTS. `src/xmile/expr.cljc` binds every one of XMILE's
+;; WHY THIS FILE EXISTS. `src/xmile/expr.cljk` binds every one of XMILE's
 ;; sec 3.5.1 math built-ins to a HOST function -- `Math/exp` on the JVM,
 ;; `js/Math.exp` on ClojureScript, sixteen reader conditionals in all. That is
 ;; the whole of XMILE's numeric semantics resting on an interop call. This
@@ -60,7 +60,7 @@
 ;; carries real XMILE semantics -- rather than plain IEEE arithmetic -- is a
 ;; function below.
 ;;
-;; AUTHORITY. `src/xmile/expr.cljc` remains the authority and the load path,
+;; AUTHORITY. `src/xmile/expr.cljk` remains the authority and the load path,
 ;; unchanged and unremoved. This file proves the logic is expressible; it does
 ;; not replace it. Root ADR-2608130900 records what happens when a `.kotoba`
 ;; migration removes the `.cljc` a consumer loads: this repository was one of

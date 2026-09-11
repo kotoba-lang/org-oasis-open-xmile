@@ -116,7 +116,7 @@ adds the hidden stock(s) internally:
 
 ## Kotoba decision core
 
-`src/xmile/expr.cljc` binds every one of XMILE's sec 3.5.1 math built-ins to a
+`src/xmile/expr.cljk` binds every one of XMILE's sec 3.5.1 math built-ins to a
 host function -- `Math/exp` on the JVM, `js/Math.exp` on ClojureScript, sixteen
 reader conditionals in all. That is the whole of XMILE's numeric semantics
 resting on interop, and it is why the equation language could not be evaluated
@@ -173,16 +173,16 @@ outside the structured scalar ABI*). The conversion is exact in both directions
 -- signed zero and NaN payloads survive, and there is a test that says so -- and
 two functions know about it, so widening the ABI is a two-function change.
 
-**`src/xmile/expr.cljc` is unchanged, and remains both the authority and the
+**`src/xmile/expr.cljk` is unchanged, and remains both the authority and the
 thing consumers load.** The port proves the logic is expressible; it does not
 replace it. Two gates compile the port and run it through the KIR interpreter in
 the same JVM, asserting against the real `xmile.expr`:
 
-- `test/xmile/kotoba_expr_core_parity_test.clj` -- the operations, one at a time.
-- `test/xmile/kotoba_eval_expr_parity_test.clj` -- the walk. Every case there
+- `test/xmile/kotoba_expr_core_parity_test.cljk` -- the operations, one at a time.
+- `test/xmile/kotoba_eval_expr_parity_test.cljk` -- the walk. Every case there
   starts from an equation *string* and runs the real `xmile.expr/parse` over it,
   so the trees under test are the ones the parser actually produces.
-- `test/xmile/kotoba_simulation_parity_test.clj` -- the step. This one is
+- `test/xmile/kotoba_simulation_parity_test.cljk` -- the step. This one is
   `xmile.execute/run`'s own loop with every number in it coming from the port,
   asserted against `xmile.execute/run` over whole trajectories: five models,
   every recorded variable at every recorded time, and equality rather than a
