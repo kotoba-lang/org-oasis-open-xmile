@@ -15,7 +15,7 @@
 Run the externally grounded gate:
 
 ```bash
-clojure -M:conformance
+kbb -M:conformance
 ```
 
 The command validates emitted XML against the official OASIS XSD and requires
