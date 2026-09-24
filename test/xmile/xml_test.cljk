@@ -4,7 +4,7 @@
   fixture built with integer literals would legitimately fail `=` after a
   round trip (Clojure's `=` distinguishes 50 from 50.0) even though nothing
   is actually broken."
-  (:require #?(:clj [clojure.test :refer [deftest is]]
+  (:require #?(:clj [kotoba.test :refer [deftest is]]
                :cljs [cljs.test :refer-macros [deftest is]])
             [xmile.model :as m]
             [xmile.xml :as xml]))

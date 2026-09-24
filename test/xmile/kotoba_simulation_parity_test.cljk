@@ -30,7 +30,7 @@
   Deriving the evaluation order is a graph colouring over the model that also
   proves there is no algebraic loop -- a different kind of claim from anything
   the port makes, and deliberately still `.cljc`."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [kotoba.compiler.core :as compiler]
             [kotoba.kir :as ir]
             [xmile.execute :as execute]

@@ -27,7 +27,7 @@
   EXACT vs TOLERANT is inherited from the scalar gate and for the same reason:
   an equation with no transcendental in it must agree bit-for-bit."
   (:require [kotoba.lang.text :as str]
-            [clojure.test :refer [deftest is testing]]
+            [kotoba.test :refer [deftest is testing]]
             [kotoba.compiler.core :as compiler]
             [kotoba.kir :as ir]
             [xmile.expr :as expr]))
