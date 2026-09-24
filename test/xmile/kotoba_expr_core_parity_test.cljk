@@ -31,7 +31,7 @@
   than the host on purpose: it traps where the host would hand back NaN or an
   infinity. That direction is checked too -- a gate that only ever shows
   agreement has not shown that it can disagree."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [kotoba.compiler.core :as compiler]
             [kotoba.kir :as ir]
             [xmile.expr :as expr]))

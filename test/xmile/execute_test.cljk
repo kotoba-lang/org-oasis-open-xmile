@@ -1,5 +1,5 @@
 (ns xmile.execute-test
-  (:require #?(:clj [clojure.test :refer [deftest is testing]]
+  (:require #?(:clj [kotoba.test :refer [deftest is testing]]
                :cljs [cljs.test :refer-macros [deftest is testing]])
             [xmile.model :as m]
             [xmile.execute :as ex]))
