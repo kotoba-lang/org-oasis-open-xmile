@@ -12,7 +12,7 @@
   DELAY1/DELAY3/SMTH1/SMTH3/TREND ARE implemented, via `desugar-delays`
   below (`run` calls it once up front) -- see that function's docstring for
   the exact construction and spec/Vensim citations."
-  (:require [clojure.set :as set]
+  (:require [kotoba.lang.coll :as set]
             [kotoba.lang.text :as str]
             [xmile.model :as m]
             [xmile.expr :as expr]))
