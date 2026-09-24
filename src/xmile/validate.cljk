@@ -18,7 +18,7 @@
   (right argument count; a positive delay/smoothing/averaging-time where
   that argument is a literal constant)."
   (:require [kotoba.lang.text :as str]
-            [clojure.set :as set]
+            [kotoba.lang.coll :as set]
             [kotoba.dsl.problem :as problem]
             [xmile.model :as m]
             [xmile.expr :as expr]))
