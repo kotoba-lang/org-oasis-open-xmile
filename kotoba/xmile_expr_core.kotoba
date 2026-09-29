@@ -54,7 +54,7 @@
 ;;
 ;; WHAT IS NOT HERE, AND WHY. Expression-TREE walking and the `{"Name" value}`
 ;; environment stay in `.cljc`. This is the decision-core shape the workspace
-;; rule prescribes (root CLAUDE.md, "移行の単位は決定核"): scalars and records
+;; rule prescribes (root AGENTS.md, "移行の単位は決定核"): scalars and records
 ;; cross, collection assembly does not. `xmile.expr/eval-expr` dispatches on a
 ;; recursive tree and looks names up in a map; every ARM of that dispatch that
 ;; carries real XMILE semantics -- rather than plain IEEE arithmetic -- is a
